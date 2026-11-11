@@ -639,6 +639,25 @@ class DualArmVisualWorkerNode(Node):
                 cv2.putText(display, t_lbl, (min(460, u + 16), max(25, v - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
 
+        # 绘制双方块公共交汇放置点 (金色十字标记与圆环)
+        if MODE == 'dual' and K is not None:
+            try:
+                T_bc_a = state.get_arm_T_base_cam("arm_a")
+                if T_bc_a is not None:
+                    T_cam_a = np.linalg.inv(T_bc_a)
+                    tz_a = float(cfg["arms"]["arm_a"].get("table_z_base", -0.005))
+                    p_mid_cam = (T_cam_a @ np.array([0.180, -0.315, tz_a + 0.004, 1.0]))[:3]
+                    uv_mid, _ = cv2.projectPoints(p_mid_cam.reshape(1, 1, 3), np.zeros(3), np.zeros(3), K, D)
+                    um_rot = 639 - int(round(uv_mid[0, 0, 0]))
+                    vm_rot = 479 - int(round(uv_mid[0, 0, 1]))
+                    if 0 <= um_rot < 640 and 0 <= vm_rot < 480:
+                        cv2.drawMarker(display, (um_rot, vm_rot), (0, 215, 255), cv2.MARKER_CROSS, 16, 2)
+                        cv2.circle(display, (um_rot, vm_rot), 8, (0, 215, 255), 1)
+                        cv2.putText(display, "[MID-ZONE]", (max(10, um_rot - 38), max(15, vm_rot - 12)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 215, 255), 1)
+            except Exception:
+                pass
+
         _, jpeg = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 75])
         with state.lock:
             state.annotated_jpeg = jpeg.tobytes()
@@ -1268,8 +1287,9 @@ def run_cube_swap_workflow(target_step="all"):
         tz_a = float(cfg["arms"]["arm_a"].get("table_z_base", -0.005))
         tz_b = float(cfg["arms"]["arm_b"].get("table_z_base", -0.005))
 
-        # 公共区域黄金交汇点 P_mid (位于桌面中垂线上，兼具双臂最佳抓放半径与RealSense清晰视野)
-        p_mid_A = np.array([0.200, 0.310, tz_a + 0.004])
+        # 公共区域黄金交汇点 P_mid (位于两臂中垂线上，兼具双臂最佳抓放半径与RealSense清晰视野)
+        # 经双臂基座相对外参 T_baseA_baseB 计算，B臂在A臂的 Y=-0.630m 处，故中点为 Y=-0.315m
+        p_mid_A = np.array([0.180, -0.315, tz_a + 0.004])
         p_mid_B = (T_baseB_baseA @ np.array([p_mid_A[0], p_mid_A[1], p_mid_A[2], 1.0]))[:3]
 
         # 检查并获取双方块初始锚点位置
