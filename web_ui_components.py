@@ -1118,6 +1118,34 @@ def render_dual_arm_html() -> str:
           <button class="btn-slate btn-sm" onclick="postApi('/api/reconnect_arms')">🔌 重扫 CAN 总线</button>
         </div>
 
+        <!-- 双方块堆叠与空间互换专区 -->
+        <div class="box" style="border:1.5px solid #10b981; background:rgba(6,78,59,0.18); border-radius:8px; padding:9px; margin-top:6px;">
+          <div class="row-between" style="margin-bottom:5px;">
+            <b style="color:#34d399; font-size:12.5px;">🧱 双方块堆叠与空间互换</b>
+            <span class="mono" id="swap-step-pill" style="font-size:10.5px; padding:2px 7px; border-radius:4px; background:#047857; color:#ecfdf5;">待命</span>
+          </div>
+
+          <div style="font-size:11px; color:#cbd5e1; line-height:1.5; margin-bottom:7px;">
+            <div class="row-between"><span>左侧方块 A:</span><span class="mono" id="swap-cube-a" style="color:#38bdf8;">未检测</span></div>
+            <div class="row-between"><span>右侧方块 B:</span><span class="mono" id="swap-cube-b" style="color:#c084fc;">未检测</span></div>
+            <div class="row-between" style="margin-top:2px;"><span>流程进度:</span><span id="swap-status-txt" style="color:#facc15; font-size:10.5px;">待命 (请在左侧放A，右侧放B)</span></div>
+          </div>
+
+          <button class="btn-green" style="background:#059669; font-weight:700; width:100%; margin-bottom:6px;" onclick="startSwap('all')">🚀 双方块堆叠与空间互换 (一键全流程)</button>
+
+          <div class="btn-row" style="margin-bottom:6px;">
+            <button class="btn-blue btn-sm" onclick="startSwap(1)" title="机械臂A抓取方块A送至公共交接点底座，A避让让位">① A送底座</button>
+            <button class="btn-purple btn-sm" onclick="startSwap(2)" title="机械臂B抓取方块B堆叠在方块A上方(+25mm)，B避让让位">② B叠顶层</button>
+            <button class="btn-blue btn-sm" onclick="startSwap(3)" title="机械臂A取下顶层方块B(+25mm)并送回方块A初始位，A避让让位">③ A取顶归位</button>
+            <button class="btn-purple btn-sm" onclick="startSwap(4)" title="机械臂B取下底层方块A并送回方块B初始位，B归位">④ B取底归位</button>
+          </div>
+
+          <div class="btn-row">
+            <button class="btn-red btn-sm" style="flex:1;" onclick="postApi('/api/workflow/abort')">🛑 紧急停止</button>
+            <button class="btn-slate btn-sm" style="flex:1;" onclick="postApi('/api/workflow/reset_anchors')">🔄 重置记忆点</button>
+          </div>
+        </div>
+
         <button class="btn-green" id="c-btn-auto" onclick="postApi('/api/pick_and_return',{arm_mode:'auto'})">🤖 智能择近臂 · 原地抓放</button>
         <button class="btn-blue" id="c-btn-autopl" onclick="postApi('/api/pick_and_place',{arm_mode:'auto'})">📍 智能调度 · 搬至点击点 (超距自动接力)</button>
         <button class="btn-purple" id="c-btn-relay" onclick="postApi('/api/pick_and_place',{arm_mode:'relay'})">🤝 双臂协同接力 (源臂→中继交接→另一臂)</button>
@@ -1318,6 +1346,35 @@ def render_dual_arm_html() -> str:
         viewer3d.updateData(d.traj_3d.points, d.traj_3d.curr);
       }
 
+      // 双方块堆叠与空间互换专区数据渲染
+      if (d.cubes) {
+        const ca = d.cubes.A, cb = d.cubes.B;
+        const aEl = document.getElementById('swap-cube-a');
+        if (aEl) {
+          aEl.innerText = ca.detected
+            ? (ca.p_base_mm ? `A:[${ca.p_base_mm.join(',')}] mm` : `CAM:[${(ca.p_cam_mm||[]).join(',')}]`)
+            : (ca.init_p_base_mm ? `已锁初始:[${ca.init_p_base_mm.join(',')}]` : '未识别');
+          aEl.style.color = ca.detected ? '#38bdf8' : '#94a3b8';
+        }
+        const bEl = document.getElementById('swap-cube-b');
+        if (bEl) {
+          bEl.innerText = cb.detected
+            ? (cb.p_base_mm ? `B:[${cb.p_base_mm.join(',')}] mm` : `CAM:[${(cb.p_cam_mm||[]).join(',')}]`)
+            : (cb.init_p_base_mm ? `已锁初始:[${cb.init_p_base_mm.join(',')}]` : '未识别');
+          bEl.style.color = cb.detected ? '#c084fc' : '#94a3b8';
+        }
+      }
+      if (d.swap_workflow) {
+        const sw = d.swap_workflow;
+        const pill = document.getElementById('swap-step-pill');
+        if (pill) {
+          pill.innerText = sw.busy ? `正在执行: 第${sw.step}步` : (sw.step === 4 ? '🎉 互换完成' : `步进: ${sw.step}/4`);
+          pill.style.background = sw.busy ? '#d97706' : (sw.step === 4 ? '#059669' : '#334155');
+        }
+        const txt = document.getElementById('swap-status-txt');
+        if (txt) txt.innerText = sw.status || '--';
+      }
+
       document.getElementById('c-btn-auto').disabled = d.task_busy || !d.tag_detected;
       document.getElementById('c-btn-autopl').disabled = d.task_busy || !d.tag_detected || !d.clicked_uv;
       document.getElementById('c-btn-relay').disabled = d.task_busy || !d.tag_detected || !d.clicked_uv;
@@ -1331,6 +1388,15 @@ def render_dual_arm_html() -> str:
     }).catch(() => {});
   }
   setInterval(updateStatus, 250);
+
+  function startSwap(step) {
+    const title = step === 'all'
+      ? '确定启动双方块【堆叠与空间互换】一键全流程吗？\n\n执行顺序:\n① 机械臂 A 抓取方块 A 送往公共底座并避让\n② 机械臂 B 抓取方块 B 堆叠在方块 A 顶面并避让\n③ 机械臂 A 取下顶层方块 B 送回方块 A 初始位并避让\n④ 机械臂 B 取下底层方块 A 送回方块 B 初始位并归位'
+      : '确定执行双方块协同步骤 ' + step + ' 吗？';
+    if (confirm(title)) {
+      postApi('/api/workflow/swap_cubes', { step: step });
+    }
+  }
 </script>
 </body>
 </html>

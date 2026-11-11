@@ -172,14 +172,19 @@ class MultiScaleAprilTagDetector:
             return det.detectMarkers(gray)
         return cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=params)
 
-    def detect(self, bgr_frame: np.ndarray, K: np.ndarray, D: np.ndarray, aligned_depth: np.ndarray = None):
+    def detect_all(self, bgr_frame: np.ndarray, K: np.ndarray, D: np.ndarray, aligned_depth: np.ndarray = None):
         """
-        返回 None 或字典:
-          id, corners_2d (4x2), uv_center (2,), p_cam (3,), rvec (3,1), tvec_pnp (3,1),
-          yaw_vec_cam (3,), depth_mm, used_upscale
+        返回视野内所有检测到的 AprilTag 列表:
+        [
+          {
+            "id": tid, "corners": tc, "uv": uv, "p_cam": p_cam, "rvec": rvec,
+            "tvec_pnp": tvec_pnp, "yaw_vec_cam": yaw_vec_cam, "depth_mm": depth_mm,
+            "upscaled": is_up
+          }, ...
+        ]
         """
-        if K is None:
-            return None
+        if K is None or bgr_frame is None:
+            return []
 
         gray = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = self._run_detect(gray, robust=False)
@@ -192,50 +197,56 @@ class MultiScaleAprilTagDetector:
             scale = 2.0
 
         if ids is None or len(ids) == 0:
-            return None
+            return []
 
-        tid = int(ids.flatten()[0])
-        tc = (corners[0].reshape((4, 2)) / scale).astype(np.float64)
-        uv = tc.mean(axis=0)
-        u_px, v_px = int(round(uv[0])), int(round(uv[1]))
+        results = []
+        for i in range(len(ids)):
+            tid = int(ids[i].flatten()[0])
+            tc = (corners[i].reshape((4, 2)) / scale).astype(np.float64)
+            uv = tc.mean(axis=0)
+            u_px, v_px = int(round(uv[0])), int(round(uv[1]))
 
-        ok, rvec, tvec_pnp = cv2.solvePnP(
-            self.obj_pts, tc.astype(np.float32), K, D, flags=cv2.SOLVEPNP_ITERATIVE
-        )
-        if not ok:
-            return None
+            ok, rvec, tvec_pnp = cv2.solvePnP(
+                self.obj_pts, tc.astype(np.float32), K, D, flags=cv2.SOLVEPNP_ITERATIVE
+            )
+            if not ok:
+                continue
 
-        R_cam, _ = cv2.Rodrigues(rvec)
-        # 相机系中 Tag X 边缘方向 (用于对齐夹爪偏航角)
-        yaw_vec_cam = R_cam[:, 0].copy()
+            R_cam, _ = cv2.Rodrigues(rvec)
+            yaw_vec_cam = R_cam[:, 0].copy()
 
-        # 优先使用 RealSense 对齐硬件深度反投影计算毫米级精确 3D 坐标
-        p_cam = tvec_pnp.flatten().astype(float)
-        depth_mm = float(p_cam[2] * 1000.0)
-        if aligned_depth is not None:
-            h_d, w_d = aligned_depth.shape[:2]
-            y0, y1 = max(0, v_px - 2), min(h_d, v_px + 3)
-            x0, x1 = max(0, u_px - 2), min(w_d, u_px + 3)
-            patch = aligned_depth[y0:y1, x0:x1]
-            valid = patch[(patch > 150) & (patch < 1500)]
-            if len(valid) > 0:
-                z_m = float(np.median(valid)) / 1000.0
-                x_m = (uv[0] - K[0, 2]) * z_m / K[0, 0]
-                y_m = (uv[1] - K[1, 2]) * z_m / K[1, 1]
-                p_cam = np.array([x_m, y_m, z_m], dtype=float)
-                depth_mm = z_m * 1000.0
+            p_cam = tvec_pnp.flatten().astype(float)
+            depth_mm = float(p_cam[2] * 1000.0)
+            if aligned_depth is not None:
+                h_d, w_d = aligned_depth.shape[:2]
+                y0, y1 = max(0, v_px - 2), min(h_d, v_px + 3)
+                x0, x1 = max(0, u_px - 2), min(w_d, u_px + 3)
+                patch = aligned_depth[y0:y1, x0:x1]
+                valid = patch[(patch > 150) & (patch < 1500)]
+                if len(valid) > 0:
+                    z_m = float(np.median(valid)) / 1000.0
+                    x_m = (uv[0] - K[0, 2]) * z_m / K[0, 0]
+                    y_m = (uv[1] - K[1, 2]) * z_m / K[1, 1]
+                    p_cam = np.array([x_m, y_m, z_m], dtype=float)
+                    depth_mm = z_m * 1000.0
 
-        return {
-            "id": tid,
-            "corners": tc,
-            "uv": uv,
-            "p_cam": p_cam,
-            "rvec": rvec,
-            "tvec_pnp": tvec_pnp,
-            "yaw_vec_cam": yaw_vec_cam,
-            "depth_mm": depth_mm,
-            "upscaled": (scale > 1.0),
-        }
+            results.append({
+                "id": tid,
+                "corners": tc,
+                "uv": uv,
+                "p_cam": p_cam,
+                "rvec": rvec,
+                "tvec_pnp": tvec_pnp,
+                "yaw_vec_cam": yaw_vec_cam,
+                "depth_mm": depth_mm,
+                "upscaled": (scale > 1.0),
+            })
+        return results
+
+    def detect(self, bgr_frame: np.ndarray, K: np.ndarray, D: np.ndarray, aligned_depth: np.ndarray = None):
+        """兼容单标靶调用"""
+        res = self.detect_all(bgr_frame, K, D, aligned_depth)
+        return res[0] if res else None
 
 
 def draw_arm_ar_overlay(display: np.ndarray, arm_label: str, T_base_cam: np.ndarray,
