@@ -430,6 +430,26 @@ def render_single_arm_html() -> str:
     border-color: #38bdf8 transparent transparent transparent;
     z-index: 10000;
   }
+  /* 靠左对齐：防止最左侧文字被遮挡 */
+  .has-tip.tip-left:hover::after {
+    left: 0;
+    transform: none;
+  }
+  .has-tip.tip-left:hover::before {
+    left: 18px;
+    transform: none;
+  }
+  /* 靠右对齐：防止最右侧文字被遮挡 */
+  .has-tip.tip-right:hover::after {
+    left: auto;
+    right: 0;
+    transform: none;
+  }
+  .has-tip.tip-right:hover::before {
+    left: auto;
+    right: 18px;
+    transform: none;
+  }
 </style>
 </head>
 <body>
@@ -511,17 +531,22 @@ def render_single_arm_html() -> str:
         </div>
 
         <div class="box">
-          <div class="row-between"><span class="has-tip" data-tip="【下探深度】夹爪指尖相对方块顶面(AprilTag)向下深入量。默认-25.5mm直达方块腰部中心；数值太浅抓不稳，数值过深擦碰桌面。">⬇️ 相对方块顶下探深度:</span><span class="mono" id="val-zoff">-25.5 mm</span></div>
+          <div class="row-between"><span class="has-tip tip-left" data-tip="【下探深度】夹爪指尖相对方块顶面(AprilTag)向下深入量。默认-25.5mm直达方块腰部中心；数值太浅抓不稳，数值过深擦碰桌面。">⬇️ 相对方块顶下探深度:</span><span class="mono" id="val-zoff">-25.5 mm</span></div>
           <input type="range" id="slider-zoff" style="width:100%;" min="-32" max="-10" step="0.5" value="-25.5" onchange="updateGripperParams()" oninput="document.getElementById('val-zoff').innerText=this.value+' mm'">
-          <div class="row-between" style="margin-top:4px;"><span class="has-tip" data-tip="【X轴抓点补偿】夹爪抓取中心沿机械臂基座X轴前后微调(mm)。正值向前推，负值向后收，用于补偿手眼标定轻微偏差。">↔️ X轴抓点补偿:</span><span class="mono" id="val-xoff">0.0 mm</span></div>
+          <div class="row-between" style="margin-top:4px;"><span class="has-tip tip-left" data-tip="【X轴抓点补偿】夹爪抓取中心沿机械臂基座X轴前后微调(mm)。正值向前推，负值向后收，用于补偿手眼标定轻微偏差。">↔️ X轴抓点补偿:</span><span class="mono" id="val-xoff">0.0 mm</span></div>
           <input type="range" id="slider-xoff" style="width:100%;" min="-15" max="15" step="0.5" value="0.0" onchange="updateGripperParams()" oninput="document.getElementById('val-xoff').innerText=(this.value>0?'+':'')+this.value+' mm'">
-          <div class="row-between" style="margin-top:4px;"><span class="has-tip" data-tip="【Y轴抓点补偿】夹爪抓取中心沿机械臂基座Y轴左右微调(mm)。正值向左偏，负值向右偏，确保夹爪两指对称卡入方块两侧。">↕️ Y轴抓点补偿:</span><span class="mono" id="val-yoff">0.0 mm</span></div>
+          <div class="row-between" style="margin-top:4px;"><span class="has-tip tip-left" data-tip="【Y轴抓点补偿】夹爪抓取中心沿机械臂基座Y轴左右微调(mm)。正值向左偏，负值向右偏，确保夹爪两指对称卡入方块两侧。">↕️ Y轴抓点补偿:</span><span class="mono" id="val-yoff">0.0 mm</span></div>
           <input type="range" id="slider-yoff" style="width:100%;" min="-15" max="15" step="0.5" value="0.0" onchange="updateGripperParams()" oninput="document.getElementById('val-yoff').innerText=(this.value>0?'+':'')+this.value+' mm'">
-          <div class="row-between" style="margin-top:4px;"><span class="has-tip" data-tip="【抓持力矩与开度】左滑块为闭合电机力矩限制(默认350mN·m即0.35N·m)；右滑块为闭合目标物理间距(默认26.5mm包夹25mm方块)。">🤏 抓持力矩 / 开度:</span><span class="mono" id="val-ew">350 mN·m / 26.5 mm</span></div>
+          <div class="row-between" style="margin-top:4px;"><span class="has-tip tip-left" data-tip="【抓持力矩与开度】左滑块为闭合电机力矩限制(默认350mN·m即0.35N·m)；右滑块为闭合目标物理间距(默认26.5mm包夹25mm方块)。">🤏 抓持力矩 / 开度:</span><span class="mono" id="val-ew">350 mN·m / 26.5 mm</span></div>
           <div style="display:flex; gap:8px;">
             <input type="range" id="slider-effort" style="flex:1;" min="200" max="1000" step="50" value="350" onchange="updateGripperParams()" oninput="updEWLabel()">
             <input type="range" id="slider-width" style="flex:1;" min="20" max="29" step="0.5" value="26.5" onchange="updateGripperParams()" oninput="updEWLabel()">
           </div>
+          <div class="row-between" style="margin-top:6px; border-top:1px dashed #1e293b; padding-top:4px;">
+            <span class="has-tip tip-left" data-tip="【运行速度】控制机械臂所有抓放与过渡轨迹的运动速率。默认100%标准速度，可调慢至20%方便细致观察，或调至150%高速。">⚡ 抓放速度: <b id="val-spd">100</b>%</span>
+            <span class="mono" id="spd-tag" style="font-size:11px; color:#38bdf8;">标准</span>
+          </div>
+          <input type="range" id="slider-speed" style="width:100%;" min="20" max="150" step="5" value="100" onchange="updateGripperParams()" oninput="document.getElementById('val-spd').innerText=this.value; document.getElementById('spd-tag').innerText=(this.value<70?'慢速':(this.value>110?'高速':'标准'))">
         </div>
 
         <button class="btn-green" id="btn-return" onclick="postApi('/api/pick_and_return')">🤖 一键原地抓取并放回</button>
@@ -622,7 +647,8 @@ def render_single_arm_html() -> str:
       width_mm: document.getElementById('slider-width').value,
       z_offset_mm: document.getElementById('slider-zoff').value,
       x_offset_mm: document.getElementById('slider-xoff').value,
-      y_offset_mm: document.getElementById('slider-yoff').value
+      y_offset_mm: document.getElementById('slider-yoff').value,
+      speed_pct: document.getElementById('slider-speed').value
     });
   }
   let winCamOn = false;
@@ -674,6 +700,10 @@ def render_single_arm_html() -> str:
         document.getElementById('val-yoff').innerText = (yoff > 0 ? '+' : '') + yoff + ' mm';
         document.getElementById('slider-effort').value = arm.grasp_effort;
         document.getElementById('slider-width').value = arm.grasp_target_mm;
+        const s_spd = arm.speed_pct || 100;
+        document.getElementById('slider-speed').value = s_spd;
+        document.getElementById('val-spd').innerText = s_spd;
+        document.getElementById('spd-tag').innerText = (s_spd < 70 ? '慢速' : (s_spd > 110 ? '高速' : '标准'));
         updEWLabel();
       }
 
@@ -815,6 +845,26 @@ def render_dual_arm_html() -> str:
     border-color: #38bdf8 transparent transparent transparent;
     z-index: 10000;
   }
+  /* 靠左对齐：防止最左侧文字被遮挡 */
+  .has-tip.tip-left:hover::after {
+    left: 0;
+    transform: none;
+  }
+  .has-tip.tip-left:hover::before {
+    left: 18px;
+    transform: none;
+  }
+  /* 靠右对齐：防止最右侧文字被遮挡 */
+  .has-tip.tip-right:hover::after {
+    left: auto;
+    right: 0;
+    transform: none;
+  }
+  .has-tip.tip-right:hover::before {
+    left: auto;
+    right: 18px;
+    transform: none;
+  }
 </style>
 </head>
 <body>
@@ -928,9 +978,9 @@ def render_dual_arm_html() -> str:
 
         <div class="box">
           <div class="row-between">
-            <span class="has-tip" data-tip="【下探深度】指尖相对方块顶(AprilTag面)向下垂直深入量。默认-25.5mm深入至方块腰部中心；过浅夹不稳易脱落，过深会擦碰桌面。">⬇️ 下探: <b id="a-v-z">-25.5</b>mm</span>
+            <span class="has-tip tip-left" data-tip="【下探深度】指尖相对方块顶(AprilTag面)向下垂直深入量。默认-25.5mm深入至方块腰部中心；过浅夹不稳易脱落，过深会擦碰桌面。">⬇️ 下探: <b id="a-v-z">-25.5</b>mm</span>
             <span class="has-tip" data-tip="【X轴微调】夹爪抓取中心沿机械臂基座X轴前后补偿量(mm)。正值向前推，负值向后拉，用于补偿相机轻微安装偏差。">↔️ X偏: <b id="a-v-x">0</b>mm</span>
-            <span class="has-tip" data-tip="【Y轴微调】夹爪抓取中心沿机械臂基座Y轴左右补偿量(mm)。正值向左，负值向右，保证夹爪对称两指居中跨入方块两侧。">↕️ Y偏: <b id="a-v-y">0</b>mm</span>
+            <span class="has-tip tip-right" data-tip="【Y轴微调】夹爪抓取中心沿机械臂基座Y轴左右补偿量(mm)。正值向左，负值向右，保证夹爪对称两指居中跨入方块两侧。">↕️ Y偏: <b id="a-v-y">0</b>mm</span>
           </div>
           <div style="display:flex; gap:6px; margin:4px 0;">
             <input type="range" id="a-z" min="-32" max="-10" step="0.5" value="-25.5" onchange="saveArmParams('arm_a')" oninput="document.getElementById('a-v-z').innerText=this.value">
@@ -938,13 +988,18 @@ def render_dual_arm_html() -> str:
             <input type="range" id="a-y" min="-15" max="15" step="0.5" value="0" onchange="saveArmParams('arm_a')" oninput="document.getElementById('a-v-y').innerText=this.value">
           </div>
           <div class="row-between">
-            <span class="has-tip" data-tip="【抓持力矩】夹爪闭合抱紧方块的最大电机力矩(mN·m)。默认350mN·m(0.35N·m)。过小方块滑脱，过大(>600)易压损方块或电机过流。">🤏 力矩: <b id="a-v-e">350</b> mN·m</span>
-            <span class="has-tip" data-tip="【抓取开度】夹爪闭合抓取时的目标物理间距(mm)。方块边长25mm，默认设26.5mm，配合限矩模式实现无损柔顺包夹。">📏 开度: <b id="a-v-w">26.5</b> mm</span>
+            <span class="has-tip tip-left" data-tip="【抓持力矩】夹爪闭合抱紧方块的最大电机力矩(mN·m)。默认350mN·m(0.35N·m)。过小方块滑脱，过大(>600)易压损方块或电机过流。">🤏 力矩: <b id="a-v-e">350</b> mN·m</span>
+            <span class="has-tip tip-right" data-tip="【抓取开度】夹爪闭合抓取时的目标物理间距(mm)。方块边长25mm，默认设26.5mm，配合限矩模式实现无损柔顺包夹。">📏 开度: <b id="a-v-w">26.5</b> mm</span>
           </div>
           <div style="display:flex; gap:6px; margin-top:4px;">
             <input type="range" id="a-e" min="200" max="1000" step="50" value="350" onchange="saveArmParams('arm_a')" oninput="document.getElementById('a-v-e').innerText=this.value">
             <input type="range" id="a-w" min="20" max="29" step="0.5" value="26.5" onchange="saveArmParams('arm_a')" oninput="document.getElementById('a-v-w').innerText=this.value">
           </div>
+          <div class="row-between" style="margin-top:6px; border-top:1px dashed #1e293b; padding-top:4px;">
+            <span class="has-tip tip-left" data-tip="【运行速度】控制机械臂所有抓放与过渡轨迹的运动速率。默认100%标准速度，可调慢至20%方便细致观察，或调至150%高速。">⚡ 抓放速度: <b id="a-v-spd">100</b>%</span>
+            <span class="mono" id="a-spd-tag" style="font-size:11px; color:#38bdf8;">标准</span>
+          </div>
+          <input type="range" id="a-spd" min="20" max="150" step="5" value="100" style="margin-top:2px;" onchange="saveArmParams('arm_a')" oninput="document.getElementById('a-v-spd').innerText=this.value; document.getElementById('a-spd-tag').innerText=(this.value<70?'慢速':(this.value>110?'高速':'标准'))">
         </div>
 
         <button class="btn-green" id="a-btn-ret" onclick="postApi('/api/pick_and_return',{arm_mode:'arm_a'})">🤖 A臂 原地抓取并放回</button>
@@ -995,9 +1050,9 @@ def render_dual_arm_html() -> str:
 
         <div class="box">
           <div class="row-between">
-            <span class="has-tip" data-tip="【下探深度】指尖相对方块顶(AprilTag面)向下垂直深入量。默认-25.5mm深入至方块腰部中心；过浅夹不稳易脱落，过深会擦碰桌面。">⬇️ 下探: <b id="b-v-z">-25.5</b>mm</span>
+            <span class="has-tip tip-left" data-tip="【下探深度】指尖相对方块顶(AprilTag面)向下垂直深入量。默认-25.5mm深入至方块腰部中心；过浅夹不稳易脱落，过深会擦碰桌面。">⬇️ 下探: <b id="b-v-z">-25.5</b>mm</span>
             <span class="has-tip" data-tip="【X轴微调】夹爪抓取中心沿机械臂基座X轴前后补偿量(mm)。正值向前推，负值向后拉，用于补偿相机轻微安装偏差。">↔️ X偏: <b id="b-v-x">0</b>mm</span>
-            <span class="has-tip" data-tip="【Y轴微调】夹爪抓取中心沿机械臂基座Y轴左右补偿量(mm)。正值向左，负值向右，保证夹爪对称两指居中跨入方块两侧。">↕️ Y偏: <b id="b-v-y">0</b>mm</span>
+            <span class="has-tip tip-right" data-tip="【Y轴微调】夹爪抓取中心沿机械臂基座Y轴左右补偿量(mm)。正值向左，负值向右，保证夹爪对称两指居中跨入方块两侧。">↕️ Y偏: <b id="b-v-y">0</b>mm</span>
           </div>
           <div style="display:flex; gap:6px; margin:4px 0;">
             <input type="range" id="b-z" min="-32" max="-10" step="0.5" value="-25.5" onchange="saveArmParams('arm_b')" oninput="document.getElementById('b-v-z').innerText=this.value">
@@ -1005,13 +1060,18 @@ def render_dual_arm_html() -> str:
             <input type="range" id="b-y" min="-15" max="15" step="0.5" value="0" onchange="saveArmParams('arm_b')" oninput="document.getElementById('b-v-y').innerText=this.value">
           </div>
           <div class="row-between">
-            <span class="has-tip" data-tip="【抓持力矩】夹爪闭合抱紧方块的最大电机力矩(mN·m)。默认350mN·m(0.35N·m)。过小方块滑脱，过大(>600)易压损方块或电机过流。">🤏 力矩: <b id="b-v-e">350</b> mN·m</span>
-            <span class="has-tip" data-tip="【抓取开度】夹爪闭合抓取时的目标物理间距(mm)。方块边长25mm，默认设26.5mm，配合限矩模式实现无损柔顺包夹。">📏 开度: <b id="b-v-w">26.5</b> mm</span>
+            <span class="has-tip tip-left" data-tip="【抓持力矩】夹爪闭合抱紧方块的最大电机力矩(mN·m)。默认350mN·m(0.35N·m)。过小方块滑脱，过大(>600)易压损方块或电机过流。">🤏 力矩: <b id="b-v-e">350</b> mN·m</span>
+            <span class="has-tip tip-right" data-tip="【抓取开度】夹爪闭合抓取时的目标物理间距(mm)。方块边长25mm，默认设26.5mm，配合限矩模式实现无损柔顺包夹。">📏 开度: <b id="b-v-w">26.5</b> mm</span>
           </div>
           <div style="display:flex; gap:6px; margin-top:4px;">
             <input type="range" id="b-e" min="200" max="1000" step="50" value="350" onchange="saveArmParams('arm_b')" oninput="document.getElementById('b-v-e').innerText=this.value">
             <input type="range" id="b-w" min="20" max="29" step="0.5" value="26.5" onchange="saveArmParams('arm_b')" oninput="document.getElementById('b-v-w').innerText=this.value">
           </div>
+          <div class="row-between" style="margin-top:6px; border-top:1px dashed #1e293b; padding-top:4px;">
+            <span class="has-tip tip-left" data-tip="【运行速度】控制机械臂所有抓放与过渡轨迹的运动速率。默认100%标准速度，可调慢至20%方便细致观察，或调至150%高速。">⚡ 抓放速度: <b id="b-v-spd">100</b>%</span>
+            <span class="mono" id="b-spd-tag" style="font-size:11px; color:#c084fc;">标准</span>
+          </div>
+          <input type="range" id="b-spd" min="20" max="150" step="5" value="100" style="margin-top:2px;" onchange="saveArmParams('arm_b')" oninput="document.getElementById('b-v-spd').innerText=this.value; document.getElementById('b-spd-tag').innerText=(this.value<70?'慢速':(this.value>110?'高速':'标准'))">
         </div>
 
         <button class="btn-green" id="b-btn-ret" onclick="postApi('/api/pick_and_return',{arm_mode:'arm_b'})">🤖 B臂 原地抓取并放回</button>
@@ -1124,7 +1184,8 @@ def render_dual_arm_html() -> str:
       x_offset_mm: document.getElementById(p + '-x').value,
       y_offset_mm: document.getElementById(p + '-y').value,
       effort: document.getElementById(p + '-e').value,
-      width_mm: document.getElementById(p + '-w').value
+      width_mm: document.getElementById(p + '-w').value,
+      speed_pct: document.getElementById(p + '-spd').value
     });
   }
 
@@ -1202,6 +1263,10 @@ def render_dual_arm_html() -> str:
           document.getElementById(ch + '-v-e').innerText = arm.grasp_effort;
           document.getElementById(ch + '-w').value = arm.grasp_target_mm;
           document.getElementById(ch + '-v-w').innerText = arm.grasp_target_mm;
+          const spd = arm.speed_pct || 100;
+          document.getElementById(ch + '-spd').value = spd;
+          document.getElementById(ch + '-v-spd').innerText = spd;
+          document.getElementById(ch + '-spd-tag').innerText = (spd < 70 ? '慢速' : (spd > 110 ? '高速' : '标准'));
         }
 
         // 每臂独立标定表

@@ -547,6 +547,9 @@ class DualArmVisualWorkerNode(Node):
                 cv2.putText(display, t_lbl, (min(460, u + 16), max(25, v - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
 
+        # 响应用户需求：将网页中展示的摄像头画面旋转 180 度，方便操作者直观对照实物桌面
+        display = cv2.rotate(display, cv2.ROTATE_180)
+
         _, jpeg = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 75])
         with state.lock:
             state.annotated_jpeg = jpeg.tobytes()
@@ -717,6 +720,8 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
     effort = int(arm_cfg.get("grasp_effort", 350))
     grip_w = float(arm_cfg.get("grasp_target_mm", 26.5))
     table_z = float(arm_cfg.get("table_z_base", -0.005))
+    spd_pct = float(arm_cfg.get("speed_pct", 100))
+    spd_f = max(0.2, min(1.8, spd_pct / 100.0))
 
     gx, gy = obj_pos[0] + x_off, obj_pos[1] + y_off
     z_floor = table_z + 0.004
@@ -785,10 +790,10 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
     # === 实机执行序列 ===
     try:
         # 1. 抓取前预备：立即张开夹爪至 55mm (充分敞开)
-        state.add_log(f"👐 [{arm_id.upper()}] 预抓取准备: 展开夹爪至 55mm...")
+        state.add_log(f"👐 [{arm_id.upper()}] 预抓取准备: 展开夹爪至 55mm (速率:{int(spd_pct)}%)...")
         node.send_gripper(arm_id, 55.0, effort)
 
-        if not node.send_trajectory(arm_id, [q_ready, q_pre], 4.2):
+        if not node.send_trajectory(arm_id, [q_ready, q_pre], 4.2 / spd_f):
             state.add_log(f"❌ [{arm_id}] 飞抵悬停失败")
             return False
 
@@ -803,7 +808,7 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
             node.send_gripper(arm_id, 55.0, effort)
             time.sleep(0.12)
 
-        if not node.send_trajectory(arm_id, wp_down, 3.0):
+        if not node.send_trajectory(arm_id, wp_down, 3.0 / spd_f):
             state.add_log(f"❌ [{arm_id}] 垂直下探失败")
             return False
 
@@ -813,27 +818,27 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
         with state.lock:
             state.carrying_arm = arm_id
 
-        if not node.send_trajectory(arm_id, wp_lift, 2.2):
+        if not node.send_trajectory(arm_id, wp_lift, 2.2 / spd_f):
             return False
         time.sleep(0.3)
 
         if mode == 'place' and wp_pl_down is not None:
             state.add_log(f"✈️ [{arm_id}] 搬运前往目标点...")
-            if not node.send_trajectory(arm_id, [q_pl_above], 3.8):
+            if not node.send_trajectory(arm_id, [q_pl_above], 3.8 / spd_f):
                 return False
-            if not node.send_trajectory(arm_id, wp_pl_down, 2.8):
+            if not node.send_trajectory(arm_id, wp_pl_down, 2.8 / spd_f):
                 return False
             with state.lock:
                 state.carrying_arm = None
             node.send_gripper(arm_id, 50.0, effort)
             time.sleep(0.6)
-            node.send_trajectory(arm_id, wp_pl_up, 2.0)
+            node.send_trajectory(arm_id, wp_pl_up, 2.0 / spd_f)
             q_ret_from = wp_pl_up[-1]
         else:
             state.add_log(f"⏬ [{arm_id}] 原地放回...")
             wp_ret_dn, _ = solve_cartesian_segment(wp_lift[-1], p_lift, p_grasp, R_grasp, num_steps=10)
             if wp_ret_dn:
-                node.send_trajectory(arm_id, wp_ret_dn, 2.6)
+                node.send_trajectory(arm_id, wp_ret_dn, 2.6 / spd_f)
             with state.lock:
                 state.carrying_arm = None
             node.send_gripper(arm_id, 50.0, effort)
@@ -842,14 +847,14 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
                 wp_ret_dn[-1] if wp_ret_dn else wp_lift[-1], p_grasp, p_lift, R_grasp, num_steps=6
             )
             if wp_ret_up:
-                node.send_trajectory(arm_id, wp_ret_up, 1.8)
+                node.send_trajectory(arm_id, wp_ret_up, 1.8 / spd_f)
             q_ret_from = wp_ret_up[-1] if wp_ret_up else wp_lift[-1]
 
         state.add_log(f"🏠 [{arm_id}] 安全退回待命折叠原点...")
         q_home = get_home_joints_rad()
         theta_cur = float(q_ret_from[0])
         q_exit = choose_safe_ready_pose(theta_cur, q_ret_from, q_home, cam_pos)
-        node.send_trajectory(arm_id, [q_exit, q_home], 3.8)
+        node.send_trajectory(arm_id, [q_exit, q_home], 3.8 / spd_f)
         node.send_gripper(arm_id, 0.0, effort)
         return True
     finally:
@@ -1113,6 +1118,7 @@ class VisualHttpHandler(BaseHTTPRequestHandler):
                             "grasp_x_offset_mm": cfg["arms"][aid].get("grasp_x_offset_mm", 0.0),
                             "grasp_y_offset_mm": cfg["arms"][aid].get("grasp_y_offset_mm", 0.0),
                             "grasp_z_offset_mm": cfg["arms"][aid].get("grasp_z_offset_mm", -25.5),
+                            "speed_pct": cfg["arms"][aid].get("speed_pct", 100),
                             "runtime": {k: v for k, v in state.arm_runtime[aid].items() if k != "joints"},
                         }
                         for aid in ("arm_a", "arm_b")
@@ -1296,7 +1302,11 @@ class VisualHttpHandler(BaseHTTPRequestHandler):
             self._send_json({"status": "ok", "rmse_mm": round(rmse, 2)})
 
         elif parsed.path == '/api/select_point':
-            u, v = int(body.get('u', 320)), int(body.get('v', 240))
+            # 由于网页展示画面旋转了 180 度，点击坐标 (u, v) 映射回原相机真实坐标系 (639 - u, 479 - v)
+            raw_u = int(body.get('u', 320))
+            raw_v = int(body.get('v', 240))
+            u = max(0, min(639, 639 - raw_u))
+            v = max(0, min(479, 479 - raw_v))
             p_cam = worker_node.get_depth_3d_cam(u, v)
             if p_cam is None:
                 self._send_json({"status": "error", "msg": "相机尚未就绪"})
@@ -1327,6 +1337,7 @@ class VisualHttpHandler(BaseHTTPRequestHandler):
             zoff = round(max(-32.0, min(-10.0, float(body.get('z_offset_mm', -25.5)))), 1)
             xoff = round(max(-25.0, min(25.0, float(body.get('x_offset_mm', 0.0)))), 1)
             yoff = round(max(-25.0, min(25.0, float(body.get('y_offset_mm', 0.0)))), 1)
+            spd = int(max(20, min(150, float(body.get('speed_pct', 100)))))
             with state.lock:
                 cfg = state.config
                 target_list = ("arm_a", "arm_b") if body.get("arm_id") == "all" else (default_arm,)
@@ -1337,6 +1348,7 @@ class VisualHttpHandler(BaseHTTPRequestHandler):
                         cfg["arms"][aid]["grasp_z_offset_mm"] = zoff
                         cfg["arms"][aid]["grasp_x_offset_mm"] = xoff
                         cfg["arms"][aid]["grasp_y_offset_mm"] = yoff
+                        cfg["arms"][aid]["speed_pct"] = spd
                 save_dual_config(cfg)
                 state.config_mtime = os.path.getmtime(CONFIG_PATH)
             self._send_json({"status": "ok"})
