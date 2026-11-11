@@ -1,0 +1,26 @@
+# 忽略编译产物与日志
+build/
+install/
+log/
+*.log
+
+# 忽略 Python 缓存与中间文件
+__pycache__/
+*.pyc
+*.pyo
+
+# 忽略超大压缩包（避免冲爆 GitHub 100MB 限制）
+*.zip
+*.tar.gz
+*.bak
+
+# 忽略临时数据与诊断文件
+contacts_*.txt
+gz_probe_*.txt
+*.txt
+!README.md
+!*.md
+
+# 忽略图片产物（可选：如需提交板子图片请加 !）
+*.png
+*.jpg
