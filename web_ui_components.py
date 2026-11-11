@@ -19,8 +19,13 @@ class Trajectory3DViewer {
     this.gridW = opts.gridW || 440;
     this.gridH = opts.gridH || 760;
     this.zoom = 1.0;
-    this.points = [];     // [[x, y, z_above_table], ...] (mm)
-    this.currPt = null;   // [x, y, z_above_table] (mm)
+    this.dualMode = false;
+    this.points = [];     // 单臂轨迹 [[x, y, z_above_table], ...] (mm)
+    this.currPt = null;
+    this.pointsA = [];    // 双臂模式下：方块 A 轨迹 (青蓝色)
+    this.currPtA = null;
+    this.pointsB = [];    // 双臂模式下：方块 B 轨迹 (亮紫色)
+    this.currPtB = null;
     this.dragging = false;
     this.dragButton = 0;  // 0: left (orbit), 1: middle (pan), 2: right (zoom)
     this.lastX = 0;
@@ -187,8 +192,18 @@ class Trajectory3DViewer {
   }
 
   updateData(points, currPt) {
+    this.dualMode = false;
     this.points = Array.isArray(points) ? points : [];
     this.currPt = currPt || null;
+    this.render();
+  }
+
+  updateDualData(dataA, dataB) {
+    this.dualMode = true;
+    this.pointsA = (dataA && Array.isArray(dataA.points)) ? dataA.points : [];
+    this.currPtA = (dataA && dataA.curr) ? dataA.curr : null;
+    this.pointsB = (dataB && Array.isArray(dataB.points)) ? dataB.points : [];
+    this.currPtB = (dataB && dataB.curr) ? dataB.curr : null;
     this.render();
   }
 
@@ -256,13 +271,14 @@ class Trajectory3DViewer {
     drawAxis(oz, '#60a5fa', '+Z');
   }
 
-  _drawTrajectory(ctx) {
-    if (this.points.length < 2) return;
+  _drawTrajectory(ctx, ptsList = null, fixedColor = null) {
+    const pts = ptsList || this.points;
+    if (!pts || pts.length < 2) return;
     const segs = [];
-    for (let i = 1; i < this.points.length; i++) {
-      const p0 = this.project(this.points[i - 1]);
-      const p1 = this.project(this.points[i]);
-      segs.push({ p0, p1, zMid: (this.points[i - 1][2] + this.points[i][2]) * 0.5, dMid: (p0[3] + p1[3]) * 0.5 });
+    for (let i = 1; i < pts.length; i++) {
+      const p0 = this.project(pts[i - 1]);
+      const p1 = this.project(pts[i]);
+      segs.push({ p0, p1, zMid: (pts[i - 1][2] + pts[i][2]) * 0.5, dMid: (p0[3] + p1[3]) * 0.5 });
     }
     segs.sort((a, b) => b.dMid - a.dMid); // 由远到近遮挡排序
     ctx.lineCap = 'round';
@@ -270,48 +286,55 @@ class Trajectory3DViewer {
       ctx.beginPath();
       ctx.moveTo(s.p0[0], s.p0[1]);
       ctx.lineTo(s.p1[0], s.p1[1]);
-      ctx.strokeStyle = this.heightColor(s.zMid);
-      ctx.lineWidth = 2.6;
+      ctx.strokeStyle = fixedColor || this.heightColor(s.zMid);
+      ctx.lineWidth = 2.4;
       ctx.stroke();
     }
-    const pStart = this.project(this.points[0]);
+    const pStart = this.project(pts[0]);
     ctx.beginPath();
-    ctx.arc(pStart[0], pStart[1], 3.5, 0, Math.PI * 2);
-    ctx.fillStyle = '#94a3b8';
+    ctx.arc(pStart[0], pStart[1], 3.2, 0, Math.PI * 2);
+    ctx.fillStyle = fixedColor || '#94a3b8';
     ctx.fill();
   }
 
-  _drawCubeParticle(ctx, w) {
-    if (!this.currPt) return;
-    const pTop = this.project(this.currPt);
-    const pShadow = this.project([this.currPt[0], this.currPt[1], 0]);
+  _drawCubeParticle(ctx, w, pt = null, palette = null, labelPrefix = '') {
+    const target = pt || this.currPt;
+    if (!target) return;
+    const pal = palette || {
+      core: '#ffffff', inner: '#fef08a', mid: '#facc15',
+      fade: 'rgba(250, 204, 21, 0)', line: 'rgba(250, 204, 21, 0.75)',
+      shadow: 'rgba(250, 204, 21, 0.45)', txt: '#fef08a'
+    };
+
+    const pTop = this.project(target);
+    const pShadow = this.project([target[0], target[1], 0]);
 
     ctx.save();
     ctx.setLineDash([4, 4]);
     ctx.beginPath(); ctx.moveTo(pShadow[0], pShadow[1]); ctx.lineTo(pTop[0], pTop[1]);
-    ctx.strokeStyle = 'rgba(250, 204, 21, 0.75)'; ctx.lineWidth = 1.4; ctx.stroke();
+    ctx.strokeStyle = pal.line; ctx.lineWidth = 1.4; ctx.stroke();
     ctx.restore();
 
     ctx.beginPath(); ctx.arc(pShadow[0], pShadow[1], 4, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(250, 204, 21, 0.45)'; ctx.fill();
+    ctx.fillStyle = pal.shadow; ctx.fill();
 
     const r = Math.max(6, Math.min(12, 7.5 * pTop[2]));
     const grad = ctx.createRadialGradient(pTop[0] - 2, pTop[1] - 2, 1, pTop[0], pTop[1], r * 1.8);
-    grad.addColorStop(0, '#fef08a');
-    grad.addColorStop(0.5, '#facc15');
-    grad.addColorStop(1, 'rgba(250, 204, 21, 0)');
+    grad.addColorStop(0, pal.inner);
+    grad.addColorStop(0.5, pal.mid);
+    grad.addColorStop(1, pal.fade);
     ctx.beginPath(); ctx.arc(pTop[0], pTop[1], r * 1.8, 0, Math.PI * 2);
     ctx.fillStyle = grad; ctx.fill();
 
     ctx.beginPath(); ctx.arc(pTop[0], pTop[1], r * 0.65, 0, Math.PI * 2);
-    ctx.fillStyle = '#ffffff'; ctx.fill();
+    ctx.fillStyle = pal.core; ctx.fill();
 
-    ctx.fillStyle = '#fef08a';
+    ctx.fillStyle = pal.txt;
     ctx.font = 'bold 11px monospace';
     ctx.fillText(
-      `(${this.currPt[0].toFixed(0)}, ${this.currPt[1].toFixed(0)}, H:${this.currPt[2].toFixed(0)}mm)`,
-      Math.min(w - 140, Math.max(8, pTop[0] + 10)),
-      Math.max(16, Math.min(this.canvas.height - 8, pTop[1] - 10))
+      `${labelPrefix}(${target[0].toFixed(0)}, ${target[1].toFixed(0)}, H:${target[2].toFixed(0)})`,
+      Math.min(w - 155, Math.max(8, pTop[0] + 10)),
+      Math.max(16, Math.min(this.canvas.height - 8, pTop[1] - 8))
     );
   }
 
@@ -321,24 +344,57 @@ class Trajectory3DViewer {
     ctx.fillStyle = '#050b16';
     ctx.fillRect(0, 0, w, h);
 
+    const palA = {
+      core: '#ffffff', inner: '#bae6fd', mid: '#38bdf8',
+      fade: 'rgba(56, 189, 248, 0)', line: 'rgba(56, 189, 248, 0.78)',
+      shadow: 'rgba(56, 189, 248, 0.45)', txt: '#38bdf8'
+    };
+    const palB = {
+      core: '#ffffff', inner: '#f5d0fe', mid: '#e879f9',
+      fade: 'rgba(232, 121, 249, 0)', line: 'rgba(232, 121, 249, 0.78)',
+      shadow: 'rgba(232, 121, 249, 0.45)', txt: '#f0abfc'
+    };
+
+    const drawContents = () => {
+      if (this.dualMode) {
+        this._drawTrajectory(ctx, this.pointsA, 'rgba(56, 189, 248, 0.85)');
+        this._drawTrajectory(ctx, this.pointsB, 'rgba(232, 121, 249, 0.85)');
+        // 按深度从远到近绘制两个彩色质点，确保堆叠时空间遮挡正确
+        const items = [];
+        if (this.currPtA) items.push({ pt: this.currPtA, pal: palA, lbl: 'A:', d: this.project(this.currPtA)[3] });
+        if (this.currPtB) items.push({ pt: this.currPtB, pal: palB, lbl: 'B:', d: this.project(this.currPtB)[3] });
+        items.sort((x, y) => y.d - x.d);
+        for (const it of items) {
+          this._drawCubeParticle(ctx, w, it.pt, it.pal, it.lbl);
+        }
+      } else {
+        this._drawTrajectory(ctx, this.points, null);
+        this._drawCubeParticle(ctx, w, this.currPt, null, '');
+      }
+    };
+
     // Z 轴在相机朝向分量 R[8] >= 0 表示处于桌面上方（俯视/侧俯）；<0 表示处于桌面下方（仰视）
     const fromTop = this.R[8] >= 0;
     if (fromTop) {
       this._drawTableAndAxes(ctx, true);
-      this._drawTrajectory(ctx);
-      this._drawCubeParticle(ctx, w);
+      drawContents();
     } else {
       // 从桌底仰视时，先画上方方块与轨迹，再覆盖半透明桌底网格，保持空间前后关系真实不颠倒
-      this._drawTrajectory(ctx);
-      this._drawCubeParticle(ctx, w);
+      drawContents();
       this._drawTableAndAxes(ctx, false);
     }
 
     if (this.infoEl) {
       const sideLabel = fromTop ? '俯视角' : '底面仰视';
-      this.infoEl.innerText = this.currPt
-        ? `质点: (${this.currPt[0].toFixed(1)}, ${this.currPt[1].toFixed(1)}, Z=${this.currPt[2].toFixed(1)}mm) · ${this.points.length}点 · ${sideLabel}`
-        : `桌面待测 (${sideLabel} · 360°自由拖拽 · 双击复位) · ${this.points.length}点`;
+      if (this.dualMode) {
+        const sA = this.currPtA ? `🔵A(${this.currPtA[0].toFixed(0)},${this.currPtA[1].toFixed(0)},H${this.currPtA[2].toFixed(0)})` : '🔵A:--';
+        const sB = this.currPtB ? `🟣B(${this.currPtB[0].toFixed(0)},${this.currPtB[1].toFixed(0)},H${this.currPtB[2].toFixed(0)})` : '🟣B:--';
+        this.infoEl.innerText = `${sA} | ${sB} · ${sideLabel}`;
+      } else {
+        this.infoEl.innerText = this.currPt
+          ? `质点: (${this.currPt[0].toFixed(1)}, ${this.currPt[1].toFixed(1)}, Z=${this.currPt[2].toFixed(1)}mm) · ${this.points.length}点 · ${sideLabel}`
+          : `桌面待测 (${sideLabel} · 360°自由拖拽 · 双击复位) · ${this.points.length}点`;
+      }
     }
   }
 }
@@ -1160,7 +1216,8 @@ def render_dual_arm_html() -> str:
 
 <script>
 ''' + TRAJ_3D_SCRIPT + r'''
-  const viewer3d = new Trajectory3DViewer('traj-3d-canvas', 'traj-3d-info', { center: [150, 260, 0], gridW: 520, gridH: 780 });
+  const viewer3d = new Trajectory3DViewer('traj-3d-canvas', 'traj-3d-info', { center: [240, -315, 0], gridW: 540, gridH: 820 });
+  let centerInitialized = false;
   const canvas = document.getElementById('live-canvas');
   const ctx = canvas.getContext('2d');
   const fpsBadge = document.getElementById('fps-indicator');
@@ -1342,8 +1399,14 @@ def render_dual_arm_html() -> str:
         : (d.has_dual_rel_tf ? `🤝 双臂外参联调就绪 (A↔B 间距约 ${d.dual_dist_mm || '--'} mm)` : '请完成两臂标定以解锁协同搬运');
 
       if (d.traj_3d) {
-        if (d.traj_3d.center) viewer3d.center = d.traj_3d.center;
-        viewer3d.updateData(d.traj_3d.points, d.traj_3d.curr);
+        if (d.traj_3d.center) {
+          viewer3d.defaultCenter = d.traj_3d.center;
+          if (!centerInitialized) {
+            viewer3d.center = [...d.traj_3d.center];
+            centerInitialized = true;
+          }
+        }
+        viewer3d.updateDualData(d.traj_3d.a, d.traj_3d.b);
       }
 
       // 双方块堆叠与空间互换专区数据渲染
@@ -1353,14 +1416,14 @@ def render_dual_arm_html() -> str:
         if (aEl) {
           aEl.innerText = ca.detected
             ? (ca.p_base_mm ? `A:[${ca.p_base_mm.join(',')}] mm` : `CAM:[${(ca.p_cam_mm||[]).join(',')}]`)
-            : (ca.init_p_base_mm ? `已锁初始:[${ca.init_p_base_mm.join(',')}]` : '未识别');
+            : (ca.init_p_base_mm ? `🔒锁初位:[${ca.init_p_base_mm.join(',')}]` : '未识别');
           aEl.style.color = ca.detected ? '#38bdf8' : '#94a3b8';
         }
         const bEl = document.getElementById('swap-cube-b');
         if (bEl) {
           bEl.innerText = cb.detected
             ? (cb.p_base_mm ? `B:[${cb.p_base_mm.join(',')}] mm` : `CAM:[${(cb.p_cam_mm||[]).join(',')}]`)
-            : (cb.init_p_base_mm ? `已锁初始:[${cb.init_p_base_mm.join(',')}]` : '未识别');
+            : (cb.init_p_base_mm ? `🔒锁初位:[${cb.init_p_base_mm.join(',')}]` : '未识别');
           bEl.style.color = cb.detected ? '#c084fc' : '#94a3b8';
         }
       }
@@ -1368,8 +1431,9 @@ def render_dual_arm_html() -> str:
         const sw = d.swap_workflow;
         const pill = document.getElementById('swap-step-pill');
         if (pill) {
-          pill.innerText = sw.busy ? `正在执行: 第${sw.step}步` : (sw.step === 4 ? '🎉 互换完成' : `步进: ${sw.step}/4`);
-          pill.style.background = sw.busy ? '#d97706' : (sw.step === 4 ? '#059669' : '#334155');
+          const lockMark = sw.anchors_locked ? '🔒 ' : '';
+          pill.innerText = sw.busy ? `⏳ 执行中(${sw.step})` : (sw.step === 4 ? '🎉 互换完成' : `${lockMark}步进:${sw.step}/4`);
+          pill.style.background = sw.busy ? '#d97706' : (sw.step === 4 ? '#059669' : (sw.anchors_locked ? '#1d4ed8' : '#334155'));
         }
         const txt = document.getElementById('swap-status-txt');
         if (txt) txt.innerText = sw.status || '--';

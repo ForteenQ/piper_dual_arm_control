@@ -49,6 +49,7 @@ from piper_kinematics_engine import (
     solve_cartesian_segment,
     check_trajectory_safety,
     choose_safe_ready_pose,
+    choose_best_cube_x_dir,
     rot_to_quat,
     get_home_joints_rad,
 )
@@ -113,9 +114,11 @@ class DualArmSystemState:
                 "p_cam": None,
                 "p_base": None,
                 "yaw_cam": None,
+                "edge_dir": None,
                 "history": collections.deque(maxlen=6),
                 "init_p_base": None,
                 "init_p_cam": None,
+                "init_edge_dir": None,
                 "uv_rot": None,
                 "last_seen": 0.0
             },
@@ -125,22 +128,30 @@ class DualArmSystemState:
                 "p_cam": None,
                 "p_base": None,
                 "yaw_cam": None,
+                "edge_dir": None,
                 "history": collections.deque(maxlen=6),
                 "init_p_base": None,
                 "init_p_cam": None,
+                "init_edge_dir": None,
                 "uv_rot": None,
                 "last_seen": 0.0
             }
         }
+        self.anchors_locked = False
         self.swap_workflow_busy = False
         self.swap_workflow_step = 0  # 0=待命, 1=A送底座完成, 2=B叠顶层完成, 3=A取顶完成, 4=B取底完成
         self.swap_workflow_status = "待命 (请将方块A置于左侧，方块B置于右侧)"
         self.abort_workflow_flag = False
 
-        # 3D 质点轨迹跟踪缓冲
+        # 3D 双质点与单臂兼容轨迹跟踪缓冲
         self.traj_points = collections.deque(maxlen=600)
         self.traj_curr = None
+        self.traj_a_points = collections.deque(maxlen=400)
+        self.traj_a_curr = None
+        self.traj_b_points = collections.deque(maxlen=400)
+        self.traj_b_curr = None
         self.carrying_arm = None
+        self.carrying_cube = None
 
         # 双臂实时物理状态
         self.arm_runtime = {
@@ -233,8 +244,8 @@ class DualArmSystemState:
             return "arm_b"
         return "arm_a"
 
-    def record_cube_3d_point(self, p_world_m: np.ndarray, table_z_m: float, is_tag_top: bool = True):
-        """将方块中心转为相对桌面的 3D 毫米坐标并加入轨迹 (去抖过滤>=2mm步进)"""
+    def record_cube_3d_point(self, p_world_m: np.ndarray, table_z_m: float, is_tag_top: bool = True, cube_key: str = None):
+        """将方块中心转为相对桌面的 3D 毫米坐标并加入轨迹 (支持单臂主轨迹及 A/B 双方块独立轨迹)"""
         z_center_m = float(p_world_m[2]) - float(table_z_m) - (0.015 if is_tag_top else 0.0)
         pt_mm = [
             round(float(p_world_m[0]) * 1000.0, 1),
@@ -242,14 +253,34 @@ class DualArmSystemState:
             round(max(0.0, z_center_m * 1000.0), 1),
         ]
         with self.lock:
-            self.traj_curr = pt_mm
-            if not self.traj_points:
-                self.traj_points.append(pt_mm)
-            else:
-                last = self.traj_points[-1]
-                dist = math.sqrt((pt_mm[0] - last[0])**2 + (pt_mm[1] - last[1])**2 + (pt_mm[2] - last[2])**2)
-                if 2.0 <= dist <= 260.0:
+            if cube_key is None or cube_key == "A":
+                self.traj_curr = pt_mm
+                if not self.traj_points:
                     self.traj_points.append(pt_mm)
+                else:
+                    last = self.traj_points[-1]
+                    dist = math.sqrt((pt_mm[0] - last[0])**2 + (pt_mm[1] - last[1])**2 + (pt_mm[2] - last[2])**2)
+                    if 2.0 <= dist <= 260.0:
+                        self.traj_points.append(pt_mm)
+
+            if cube_key == "A":
+                self.traj_a_curr = pt_mm
+                if not self.traj_a_points:
+                    self.traj_a_points.append(pt_mm)
+                else:
+                    last = self.traj_a_points[-1]
+                    dist = math.sqrt((pt_mm[0] - last[0])**2 + (pt_mm[1] - last[1])**2 + (pt_mm[2] - last[2])**2)
+                    if 2.0 <= dist <= 260.0:
+                        self.traj_a_points.append(pt_mm)
+            elif cube_key == "B":
+                self.traj_b_curr = pt_mm
+                if not self.traj_b_points:
+                    self.traj_b_points.append(pt_mm)
+                else:
+                    last = self.traj_b_points[-1]
+                    dist = math.sqrt((pt_mm[0] - last[0])**2 + (pt_mm[1] - last[1])**2 + (pt_mm[2] - last[2])**2)
+                    if 2.0 <= dist <= 260.0:
+                        self.traj_b_points.append(pt_mm)
 
 
 state = DualArmSystemState()
@@ -448,9 +479,10 @@ class DualArmVisualWorkerNode(Node):
             self.is_processing = False
 
     def _update_3d_trajectory_from_state(self):
-        """在遮挡抓取搬运期间，用运动学指尖接续追踪 3D 质点"""
+        """在遮挡抓取搬运期间，用运动学指尖接续追踪被搬运方块的 3D 质点"""
         with state.lock:
             carry = state.carrying_arm
+            c_cube = state.carrying_cube
             cfg = state.config
             if carry is None:
                 return
@@ -470,7 +502,7 @@ class DualArmVisualWorkerNode(Node):
             p_world = (T_ab @ np.array([p_tip[0], p_tip[1], p_tip[2], 1.0]))[:3]
         else:
             p_world = p_tip
-        state.record_cube_3d_point(p_world, tz, is_tag_top=False)
+        state.record_cube_3d_point(p_world, tz, is_tag_top=False, cube_key=c_cube)
 
     def process_frame(self, frame):
         # 响应用户需求：将画面翻转 180 度。在翻转后的图像上统一绘制标注与文字，确保文字方向正立、易读
@@ -522,11 +554,15 @@ class DualArmVisualWorkerNode(Node):
                     det_b = all_dets[-1] # 最右侧为方块 B
                 else:
                     d_single = all_dets[0]
-                    # 依据已锁定的初始位置或画面中线判定方块归属
                     with state.lock:
+                        c_cube = state.carrying_cube
                         init_a = state.cubes["A"]["init_p_cam"]
                         init_b = state.cubes["B"]["init_p_cam"]
-                    if init_a is not None and init_b is not None:
+                    if c_cube == "A":
+                        det_b = d_single
+                    elif c_cube == "B":
+                        det_a = d_single
+                    elif init_a is not None and init_b is not None:
                         dist_a = np.linalg.norm(d_single["p_cam"] - init_a)
                         dist_b = np.linalg.norm(d_single["p_cam"] - init_b)
                         if dist_a < dist_b:
@@ -539,12 +575,18 @@ class DualArmVisualWorkerNode(Node):
                         else:
                             det_b = d_single
 
+                ref_arm = state.get_world_ref_arm()
+                ref_tz = float(cfg["arms"][ref_arm].get("table_z_base", -0.005))
+
                 # 分别更新与渲染方块 A 和方块 B
                 for cube_key, det_obj, color_box, label_name in [
                     ("A", det_a, (255, 230, 0), "CUBE A (Left)"),
                     ("B", det_b, (255, 100, 255), "CUBE B (Right)"),
                 ]:
                     if det_obj is None:
+                        with state.lock:
+                            if now_t - state.cubes[cube_key]["last_seen"] > 0.6:
+                                state.cubes[cube_key]["detected"] = False
                         continue
 
                     tc_rot = det_obj["tc_rot"]
@@ -553,6 +595,8 @@ class DualArmVisualWorkerNode(Node):
                     cv2.circle(display, c_center, 4, (0, 0, 255), -1)
 
                     p_cam = det_obj["p_cam"]
+                    target_arm = "arm_a" if cube_key == "A" else "arm_b"
+
                     with state.lock:
                         c_dict = state.cubes[cube_key]
                         c_dict["history"].append(p_cam)
@@ -564,22 +608,34 @@ class DualArmVisualWorkerNode(Node):
                         c_dict["uv_rot"] = [det_obj["u_rot"], det_obj["v_rot"]]
                         c_dict["last_seen"] = now_t
 
-                        # 计算基座系坐标
-                        target_arm = "arm_a" if cube_key == "A" else "arm_b"
-                        p_base, _ = state.transform_cam_to_arm(target_arm, smooth_cam, det_obj["yaw_vec_cam"])
+                        # 计算本臂基座系坐标及边缘朝向
+                        p_base, edge_dir = state.transform_cam_to_arm(target_arm, smooth_cam, det_obj["yaw_vec_cam"])
                         c_dict["p_base"] = p_base
+                        c_dict["edge_dir"] = edge_dir
 
-                        # 若当前未在执行搬运工作流，自动更新并锁定初始位姿锚点
-                        if not state.swap_workflow_busy:
+                        # 严格防覆写锁定：仅当未开始流程、未锁定且步骤为 0 时才自动标定初始锚点
+                        if not state.anchors_locked and not state.swap_workflow_busy and state.swap_workflow_step == 0:
                             c_dict["init_p_cam"] = smooth_cam.copy()
                             if p_base is not None:
                                 c_dict["init_p_base"] = p_base.copy()
+                            if edge_dir is not None:
+                                c_dict["init_edge_dir"] = edge_dir.copy()
 
                         # 兼顾原有全局单标靶接口
                         state.tag_detected = True
                         state.tag_id = det_obj["id"]
                         state.tag_pos_cam = smooth_cam
                         state.tag_yaw_cam = det_obj["yaw_vec_cam"]
+
+                    # 将双方块各自真实坐标独立推送至 3D 质点轨迹器 (仅当未被机械臂夹走时用视觉更新，防止叠加误跳)
+                    if state.carrying_cube != cube_key:
+                        p_ref, _ = state.transform_cam_to_arm(ref_arm, smooth_cam)
+                        if p_ref is not None:
+                            state.record_cube_3d_point(p_ref, ref_tz, is_tag_top=True, cube_key=cube_key)
+                        else:
+                            state.record_cube_3d_point(
+                                np.array([smooth_cam[0], smooth_cam[1], 0.515 - smooth_cam[2]]), 0.0, is_tag_top=True, cube_key=cube_key
+                            )
 
                     # 在 180度翻转后画面上直接绘制正立文本标注
                     cx_px, cy_px = int(det_obj["u_rot"]), int(det_obj["v_rot"])
@@ -593,14 +649,14 @@ class DualArmVisualWorkerNode(Node):
                     cv2.putText(display, txt_coord, (max(10, cx_px - 85), max(40, cy_px - 8)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1)
 
-                # 更新 3D 桌面轨迹（跟随当前检测到的主要方块）
-                ref_arm = state.get_world_ref_arm()
-                primary_cam = (det_a["p_cam"] if det_a is not None else det_b["p_cam"])
-                p_ref, _ = state.transform_cam_to_arm(ref_arm, primary_cam)
-                if p_ref is not None:
-                    tz = float(cfg["arms"][ref_arm].get("table_z_base", -0.005))
-                    state.record_cube_3d_point(p_ref, tz, is_tag_top=True)
+                # 若此时有臂正在搬运遮挡方块，继续用运动学推演更新被抓走的那块方块的 3D 质点
+                if state.carrying_arm is not None:
+                    self._update_3d_trajectory_from_state()
             else:
+                with state.lock:
+                    for ck in ("A", "B"):
+                        if now_t - state.cubes[ck]["last_seen"] > 0.6:
+                            state.cubes[ck]["detected"] = False
                 self._update_3d_trajectory_from_state()
 
             # 绘制标定采样点 C1..CN (坐标经 180度翻转匹配显示画面)
@@ -832,8 +888,9 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
     spd_f = max(0.2, min(1.8, spd_pct / 100.0))
 
     gx, gy = obj_pos[0] + x_off, obj_pos[1] + y_off
-    z_floor = table_z + 0.004
-    z_grasp = max(z_floor, obj_pos[2] + z_off)
+    z_desk = float(obj_pos[2]) - 0.025
+    z_grasp = max(z_desk + 0.003, obj_pos[2] + z_off)
+    tip_above_bottom = z_grasp - z_desk
     z_pre = obj_pos[2] + 0.095
     z_lift = z_grasp + 0.075
 
@@ -844,7 +901,8 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
     state.add_log(f"🦾 [{arm_id.upper()}] 锁定抓取点: ({gx*1000:.1f}, {gy*1000:.1f}, {z_grasp*1000:.1f})mm")
 
     theta_obj = math.atan2(gy, gx)
-    q_pre, ok_pre, err_pre, _ = solve_hover_ik(p_pre, target_x_dir=edge_dir)
+    best_pick_dir = choose_best_cube_x_dir(theta_obj, edge_dir)
+    q_pre, ok_pre, err_pre, _ = solve_hover_ik(p_pre, target_x_dir=best_pick_dir)
     if not ok_pre:
         state.add_log(f"🔴 [{arm_id}] 预抓取逆解失败 ({err_pre:.1f}mm)")
         return False
@@ -869,12 +927,14 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
         tb_pos, _ = state.transform_cam_to_arm(arm_id, target_cam_pos)
         if tb_pos is None:
             return False
-        z_pl_down = max(table_z + 0.008, tb_pos[2] + 0.012)
+        z_pl_down = z_desk + tip_above_bottom + 0.0015
         z_pl_above = z_pl_down + 0.090
         p_pl_ab = np.array([tb_pos[0], tb_pos[1], z_pl_above])
         p_pl_dn = np.array([tb_pos[0], tb_pos[1], z_pl_down])
 
-        q_pl_above, ok_pa, err_pa, _ = solve_hover_ik(p_pl_ab)
+        theta_pl = math.atan2(tb_pos[1], tb_pos[0])
+        best_place_dir = choose_best_cube_x_dir(theta_pl, np.array([1.0, 0.0, 0.0]))
+        q_pl_above, ok_pa, err_pa, _ = solve_hover_ik(p_pl_ab, target_x_dir=best_place_dir)
         if not ok_pa:
             state.add_log(f"🔴 [{arm_id}] 目标放置逆解失败 ({err_pa:.1f}mm)")
             return False
@@ -1106,12 +1166,18 @@ def run_retract_home_worker(arm_id="all"):
 # 双方块堆叠与空间互换高精度执行引擎
 # ==============================================================================
 def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_base: np.ndarray,
+                               pick_edge_dir=None, place_edge_dir=None,
+                               cube_top_z_ref: float = None, cube_key: str = "A",
                                is_stack_place: bool = False, is_stack_pick: bool = False) -> bool:
     """
     通用高精度笛卡尔搬运原子动作，执行完毕后自动垂直抬升并安全折叠避让回 Home
     - arm_id: "arm_a" 或 "arm_b"
     - p_pick_base: 抓取点 (基座系 [x, y, z])
     - p_place_base: 放置点 (基座系 [x, y, z])
+    - pick_edge_dir: 方块抓取时的边缘朝向向量 (用于转腕对齐平面，防止夹对角线)
+    - place_edge_dir: 放置时的目标朝向向量 (默认对齐桌面坐标轴 [1,0,0])
+    - cube_top_z_ref: 实测桌面底层方块顶面Z高度，用于反推真实局部桌面并实现 1.5mm 贴桌轻放
+    - cube_key: "A" 或 "B" (用于在 3D 质点视图中独立跟踪对应颜色质点)
     - is_stack_place: 是否堆叠在现有方块上方 (+25mm)
     - is_stack_pick: 是否抓取叠在顶层的方块 (+25mm)
     """
@@ -1142,29 +1208,43 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
     spd_pct = float(arm_cfg.get("speed_pct", 100))
     spd_f = max(0.2, min(1.8, spd_pct / 100.0))
 
-    # 1. 抓取点高度规划
-    z_floor = table_z + 0.004
-    base_pick_z = max(z_floor, p_pick_base[2] + z_off)
+    # 1. 精确反推局部真实桌面基准 Z (解决下放悬空 1-2cm 问题)
+    # 已知标准方块高度为 25mm (0.025m)
+    z_desk = table_z
+    if cube_top_z_ref is not None:
+        z_desk = float(cube_top_z_ref) - 0.025
+
+    # 2. 抓取点高度与抓持底高差计算
+    z_pick_floor = max(z_desk + 0.003, (z_desk + 0.025) + z_off)
+    base_pick_z = z_pick_floor + (0.025 if is_stack_pick else 0.0)
     if is_stack_pick:
-        base_pick_z += 0.025
-        state.add_log(f"📐 [{arm_id.upper()}] 顶层抓取模式 (Z高度自动 +25mm)")
+        state.add_log(f"📐 [{arm_id.upper()}] 顶层抓取模式 (Z高度 +25mm -> {base_pick_z*1000:.1f}mm)")
+
+    # 计算抓紧时指尖距离方块底面的真实偏移量 (>=3mm)
+    tip_above_bottom = z_pick_floor - z_desk
 
     p_grasp = np.array([p_pick_base[0] + x_off, p_pick_base[1] + y_off, base_pick_z])
     p_pre = np.array([p_grasp[0], p_grasp[1], p_grasp[2] + 0.090])
     p_lift = np.array([p_grasp[0], p_grasp[1], p_grasp[2] + 0.080])
 
-    # 2. 放置点高度规划
-    z_pl_base = max(table_z + 0.008, p_place_base[2] + 0.012)
+    # 3. 放置点高度计算：指尖下降至方块底面距离目标表面仅 +1.5mm 时温柔松爪
+    z_pl_floor = z_desk + tip_above_bottom + 0.0015
+    z_pl_base = z_pl_floor + (0.025 if is_stack_place else 0.0)
     if is_stack_place:
-        z_pl_base += 0.025
-        state.add_log(f"📐 [{arm_id.upper()}] 顶层堆叠放置模式 (Z高度自动 +25mm)")
+        state.add_log(f"📐 [{arm_id.upper()}] 顶层堆叠放置 (Z高度 +25mm -> {z_pl_base*1000:.1f}mm)")
 
     p_pl_dn = np.array([p_place_base[0], p_place_base[1], z_pl_base])
     p_pl_ab = np.array([p_place_base[0], p_place_base[1], z_pl_base + 0.090])
 
-    # 3. 逆解与笛卡尔插值
+    state.add_log(
+        f"🎯 [{arm_id.upper()}] 规划路径: ({p_grasp[0]*1000:.0f},{p_grasp[1]*1000:.0f},z={base_pick_z*1000:.1f}) -> "
+        f"({p_pl_dn[0]*1000:.0f},{p_pl_dn[1]*1000:.0f},z={z_pl_base*1000:.1f})mm (桌面基准z={z_desk*1000:.1f}mm)"
+    )
+
+    # 4. 逆解与 6 轴腕部平面精准对齐 (彻底防止夹对角线)
     theta_pick = math.atan2(p_pre[1], p_pre[0])
-    q_pre, ok_pre, err_pre, _ = solve_hover_ik(p_pre)
+    best_pick_dir = choose_best_cube_x_dir(theta_pick, pick_edge_dir)
+    q_pre, ok_pre, err_pre, _ = solve_hover_ik(p_pre, target_x_dir=best_pick_dir)
     if not ok_pre:
         state.add_log(f"🔴 [{arm_id}] 预抓取位姿逆解失败 ({err_pre:.1f}mm)")
         return False
@@ -1182,7 +1262,9 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
         state.add_log(f"🔴 [{arm_id}] 抬升直线规划失败: {msg_l}")
         return False
 
-    q_pl_above, ok_pa, err_pa, _ = solve_hover_ik(p_pl_ab)
+    theta_place = math.atan2(p_pl_ab[1], p_pl_ab[0])
+    best_place_dir = choose_best_cube_x_dir(theta_place, place_edge_dir)
+    q_pl_above, ok_pa, err_pa, _ = solve_hover_ik(p_pl_ab, target_x_dir=best_place_dir)
     if not ok_pa:
         state.add_log(f"🔴 [{arm_id}] 放置上方悬停逆解失败 ({err_pa:.1f}mm)")
         return False
@@ -1198,7 +1280,7 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
         state.add_log(f"🔴 [{arm_id}] 放置后抬升规划失败: {msg_pu}")
         return False
 
-    # 4. 执行动作序列
+    # 5. 执行动作序列
     try:
         if state.abort_workflow_flag: return False
         state.add_log(f"👐 [{arm_id.upper()}] 提前张开夹爪至 55mm (速率:{int(spd_pct)}%)...")
@@ -1207,7 +1289,6 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
         if not node.send_trajectory(arm_id, [q_ready, q_pre], 4.0 / spd_f):
             return False
 
-        # 阻塞校验夹爪充分开度 (>=42mm)
         t0 = time.time()
         while time.time() - t0 < 1.5:
             if state.arm_runtime[arm_id].get("gripper_mm", 0.0) >= 42.0:
@@ -1216,15 +1297,16 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
             time.sleep(0.1)
 
         if state.abort_workflow_flag: return False
-        state.add_log(f"⬇️ [{arm_id.upper()}] 垂直下探至抓取深度...")
+        state.add_log(f"⬇️ [{arm_id.upper()}] 垂直下探对齐方块平面...")
         if not node.send_trajectory(arm_id, wp_down, 2.8 / spd_f):
             return False
 
-        state.add_log(f"🤏 [{arm_id.upper()}] 闭合夹紧方块 (开度:{grip_w}mm, 力矩:{effort}mN·m)...")
+        state.add_log(f"🤏 [{arm_id.upper()}] 闭合夹紧方块 {cube_key} (开度:{grip_w}mm, 力矩:{effort}mN·m)...")
         node.send_gripper(arm_id, grip_w, effort)
         time.sleep(0.9)
         with state.lock:
             state.carrying_arm = arm_id
+            state.carrying_cube = cube_key
 
         if state.abort_workflow_flag: return False
         state.add_log(f"⬆️ [{arm_id.upper()}] 垂直抬升...")
@@ -1232,25 +1314,26 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
             return False
 
         if state.abort_workflow_flag: return False
-        state.add_log(f"✈️ [{arm_id.upper()}] 平移至放置点上方...")
+        state.add_log(f"✈️ [{arm_id.upper()}] 平移至目标上方并摆正...")
         if not node.send_trajectory(arm_id, [q_pl_above], 3.8 / spd_f):
             return False
 
         if state.abort_workflow_flag: return False
-        state.add_log(f"⬇️ [{arm_id.upper()}] 垂直下探就位...")
+        state.add_log(f"⬇️ [{arm_id.upper()}] 贴近桌面垂直下探就位...")
         if not node.send_trajectory(arm_id, wp_pl_down, 2.8 / spd_f):
             return False
 
         with state.lock:
             state.carrying_arm = None
-        state.add_log(f"👐 [{arm_id.upper()}] 展开夹爪至 55mm 释放方块...")
+            state.carrying_cube = None
+        state.add_log(f"👐 [{arm_id.upper()}] 贴地释放方块 {cube_key}...")
         node.send_gripper(arm_id, 55.0, effort)
         time.sleep(0.7)
 
         state.add_log(f"⬆️ [{arm_id.upper()}] 垂直抬升脱离...")
         node.send_trajectory(arm_id, wp_pl_up, 2.2 / spd_f)
 
-        state.add_log(f"🏠 [{arm_id.upper()}] 安全缩回待命折叠原点 (彻底为另一臂腾出空间)...")
+        state.add_log(f"🏠 [{arm_id.upper()}] 安全缩回待命折叠原点 (彻底为另一臂让位)...")
         q_home = get_home_joints_rad()
         theta_exit = float(wp_pl_up[-1][0])
         q_exit = choose_safe_ready_pose(theta_exit, wp_pl_up[-1], q_home, cam_pos)
@@ -1260,6 +1343,7 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
     finally:
         with state.lock:
             state.carrying_arm = None
+            state.carrying_cube = None
 
 
 def run_cube_swap_workflow(target_step="all"):
@@ -1274,6 +1358,8 @@ def run_cube_swap_workflow(target_step="all"):
         state.task_busy = True
         state.swap_workflow_busy = True
         state.abort_workflow_flag = False
+        # 一经启动，立即锁死初始记忆位置，防止分步等待期间被后台检测改写
+        state.anchors_locked = True
 
     try:
         cfg = state.config
@@ -1287,28 +1373,50 @@ def run_cube_swap_workflow(target_step="all"):
         tz_a = float(cfg["arms"]["arm_a"].get("table_z_base", -0.005))
         tz_b = float(cfg["arms"]["arm_b"].get("table_z_base", -0.005))
 
-        # 公共区域黄金交汇点 P_mid (位于两臂中垂线上，兼具双臂最佳抓放半径与RealSense清晰视野)
-        # 经双臂基座相对外参 T_baseA_baseB 计算，B臂在A臂的 Y=-0.630m 处，故中点为 Y=-0.315m
+        # 公共区域黄金交汇点 P_mid (位于两臂中垂线上)
         p_mid_A = np.array([0.180, -0.315, tz_a + 0.004])
         p_mid_B = (T_baseB_baseA @ np.array([p_mid_A[0], p_mid_A[1], p_mid_A[2], 1.0]))[:3]
 
-        # 检查并获取双方块初始锚点位置
         with state.lock:
             init_A = state.cubes["A"]["init_p_base"]
             init_B = state.cubes["B"]["init_p_base"]
+            init_edge_A = state.cubes["A"]["init_edge_dir"]
+            init_edge_B = state.cubes["B"]["init_edge_dir"]
             curr_A = state.cubes["A"]["p_base"]
             curr_B = state.cubes["B"]["p_base"]
+            curr_edge_A = state.cubes["A"]["edge_dir"]
+            curr_edge_B = state.cubes["B"]["edge_dir"]
 
         p_init_A = init_A if init_A is not None else curr_A
         p_init_B = init_B if init_B is not None else curr_B
+        edge_init_A = init_edge_A if init_edge_A is not None else curr_edge_A
+        edge_init_B = init_edge_B if init_edge_B is not None else curr_edge_B
 
         if p_init_A is None or p_init_B is None:
-            state.add_log("❌ 未能识别到双方块初始坐标！请确保左侧有方块A、右侧有方块B。")
+            state.add_log("❌ 未能识别到双方块初始坐标！请确保左侧放方块A、右侧放方块B后再试。")
+            state.anchors_locked = False
+            return
+
+        # 强防呆校验：确保记录到的初始点不是公共交接区（间距 < 70mm 说明点位被污染了）
+        dist_a_mid = float(np.hypot(p_init_A[0] - p_mid_A[0], p_init_A[1] - p_mid_A[1]))
+        dist_b_mid = float(np.hypot(p_init_B[0] - p_mid_B[0], p_init_B[1] - p_mid_B[1]))
+        if dist_a_mid < 0.070 or dist_b_mid < 0.070:
+            state.add_log(
+                f"❌ 初始记忆点异常 (A距公区={dist_a_mid*1000:.0f}mm, B距公区={dist_b_mid*1000:.0f}mm)！"
+                "请将方块摆回左/右侧初始位置并点击【🔄 重置记忆点】！"
+            )
+            state.anchors_locked = False
             return
 
         with state.lock:
             state.cubes["A"]["init_p_base"] = p_init_A.copy()
             state.cubes["B"]["init_p_base"] = p_init_B.copy()
+            if edge_init_A is not None: state.cubes["A"]["init_edge_dir"] = edge_init_A.copy()
+            if edge_init_B is not None: state.cubes["B"]["init_edge_dir"] = edge_init_B.copy()
+
+        # 用于反推真实桌面高度的顶面参考值
+        top_z_A = float(p_init_A[2])
+        top_z_B = float(p_init_B[2])
 
         steps_to_run = [1, 2, 3, 4] if target_step == "all" else [int(target_step)]
 
@@ -1318,15 +1426,26 @@ def run_cube_swap_workflow(target_step="all"):
                 break
 
             # ------------------------------------------------------------------
-            # 步骤 1: 机械臂 A 将 方块 A 运送至公共区域 (底座)
+            # 步骤 1: 机械臂 A 将 方块 A 运送至公共区域 (底座)，同时摆正对齐坐标轴
             # ------------------------------------------------------------------
             if step == 1:
                 state.swap_workflow_status = "阶段 1/4: A臂搬运方块A至公共底座"
-                state.add_log("🧱 [阶段 1/4] 机械臂 A 抓取方块 A -> 送往公共交汇点底座 -> 避让让位...")
+                state.add_log("🧱 [阶段 1/4] 机械臂 A 抓取方块 A -> 送往公共交汇点底座并摆正 -> 避让让位...")
+                # 实时获取最新的方块A坐标与角度以精准夹取
+                with state.lock:
+                    live_A = state.cubes["A"]["p_base"]
+                    live_eA = state.cubes["A"]["edge_dir"]
+                pick_pt = live_A if (live_A is not None and np.hypot(live_A[0]-p_init_A[0], live_A[1]-p_init_A[1]) < 0.04) else p_init_A
+                pick_ed = live_eA if live_eA is not None else edge_init_A
+
                 ok = execute_subtask_pick_place(
                     arm_id="arm_a",
-                    p_pick_base=p_init_A,
+                    p_pick_base=pick_pt,
                     p_place_base=p_mid_A,
+                    pick_edge_dir=pick_ed,
+                    place_edge_dir=np.array([1.0, 0.0, 0.0]), # 放置到中间时强制摆正
+                    cube_top_z_ref=top_z_A,
+                    cube_key="A",
                     is_stack_place=False,
                     is_stack_pick=False
                 )
@@ -1336,18 +1455,28 @@ def run_cube_swap_workflow(target_step="all"):
                 with state.lock:
                     state.swap_workflow_step = 1
                 state.add_log("✅ [阶段 1/4] 成功完成！方块 A 已稳置底座，A臂已完全让开。")
-                time.sleep(1.0)
+                time.sleep(0.8)
 
             # ------------------------------------------------------------------
-            # 步骤 2: 机械臂 B 将 方块 B 堆叠在 方块 A 上方
+            # 步骤 2: 机械臂 B 将 方块 B 堆叠在 方块 A 上方 (+25mm)
             # ------------------------------------------------------------------
             elif step == 2:
                 state.swap_workflow_status = "阶段 2/4: B臂搬运方块B堆叠在方块A上方"
-                state.add_log("🧱 [阶段 2/4] 机械臂 B 抓取方块 B -> 堆叠在方块 A 顶面 (+25mm) -> 避让让位...")
+                state.add_log("🧱 [阶段 2/4] 机械臂 B 抓取方块 B -> 堆叠在方块 A 顶面 (+25mm) 并摆正 -> 避让让位...")
+                with state.lock:
+                    live_B = state.cubes["B"]["p_base"]
+                    live_eB = state.cubes["B"]["edge_dir"]
+                pick_pt = live_B if (live_B is not None and np.hypot(live_B[0]-p_init_B[0], live_B[1]-p_init_B[1]) < 0.04) else p_init_B
+                pick_ed = live_eB if live_eB is not None else edge_init_B
+
                 ok = execute_subtask_pick_place(
                     arm_id="arm_b",
-                    p_pick_base=p_init_B,
+                    p_pick_base=pick_pt,
                     p_place_base=p_mid_B,
+                    pick_edge_dir=pick_ed,
+                    place_edge_dir=np.array([1.0, 0.0, 0.0]),
+                    cube_top_z_ref=top_z_B,
+                    cube_key="B",
                     is_stack_place=True,
                     is_stack_pick=False
                 )
@@ -1357,7 +1486,7 @@ def run_cube_swap_workflow(target_step="all"):
                 with state.lock:
                     state.swap_workflow_step = 2
                 state.add_log("🎉 [阶段 2/4] 成功完成！方块 B 已成功叠在方块 A 上方！B臂已完全让开。")
-                time.sleep(1.0)
+                time.sleep(0.8)
 
             # ------------------------------------------------------------------
             # 步骤 3: 机械臂 A 从公共区域取下顶层方块 B，送至方块 A 的初始位置
@@ -1365,10 +1494,28 @@ def run_cube_swap_workflow(target_step="all"):
             elif step == 3:
                 state.swap_workflow_status = "阶段 3/4: A臂取下顶层方块B送至A初始位"
                 state.add_log("🧱 [阶段 3/4] 机械臂 A 前出取下顶层方块 B (+25mm) -> 送往方块 A 初始位置 -> 避让让位...")
+                # 若视觉在公共区看到了实时方块，直接修正微偏并对齐真实角度
+                mid_pick_pt = p_mid_A.copy()
+                mid_pick_ed = np.array([1.0, 0.0, 0.0])
+                with state.lock:
+                    for ck in ("A", "B"):
+                        c_cam = state.cubes[ck]["p_cam"]
+                        c_yaw = state.cubes[ck]["yaw_cam"]
+                        if state.cubes[ck]["detected"] and c_cam is not None:
+                            pb_chk, pe_chk = state.transform_cam_to_arm("arm_a", c_cam, c_yaw)
+                            if pb_chk is not None and np.hypot(pb_chk[0] - p_mid_A[0], pb_chk[1] - p_mid_A[1]) < 0.045:
+                                mid_pick_pt[0], mid_pick_pt[1] = pb_chk[0], pb_chk[1]
+                                if pe_chk is not None: mid_pick_ed = pe_chk
+                                break
+
                 ok = execute_subtask_pick_place(
                     arm_id="arm_a",
-                    p_pick_base=p_mid_A,
+                    p_pick_base=mid_pick_pt,
                     p_place_base=p_init_A,
+                    pick_edge_dir=mid_pick_ed,
+                    place_edge_dir=edge_init_A if edge_init_A is not None else np.array([1.0, 0.0, 0.0]),
+                    cube_top_z_ref=top_z_A,
+                    cube_key="B",
                     is_stack_place=False,
                     is_stack_pick=True
                 )
@@ -1378,7 +1525,7 @@ def run_cube_swap_workflow(target_step="all"):
                 with state.lock:
                     state.swap_workflow_step = 3
                 state.add_log("✅ [阶段 3/4] 成功完成！顶层方块 B 已安置在方块 A 初始位置，A臂已完全让开。")
-                time.sleep(1.0)
+                time.sleep(0.8)
 
             # ------------------------------------------------------------------
             # 步骤 4: 机械臂 B 从公共区域取下底层方块 A，送至方块 B 的初始位置
@@ -1386,10 +1533,27 @@ def run_cube_swap_workflow(target_step="all"):
             elif step == 4:
                 state.swap_workflow_status = "阶段 4/4: B臂取下底层方块A送至B初始位"
                 state.add_log("🧱 [阶段 4/4] 机械臂 B 前出取下底层方块 A -> 送往方块 B 初始位置 -> 归位完成...")
+                mid_pick_pt = p_mid_B.copy()
+                mid_pick_ed = np.array([1.0, 0.0, 0.0])
+                with state.lock:
+                    for ck in ("A", "B"):
+                        c_cam = state.cubes[ck]["p_cam"]
+                        c_yaw = state.cubes[ck]["yaw_cam"]
+                        if state.cubes[ck]["detected"] and c_cam is not None:
+                            pb_chk, pe_chk = state.transform_cam_to_arm("arm_b", c_cam, c_yaw)
+                            if pb_chk is not None and np.hypot(pb_chk[0] - p_mid_B[0], pb_chk[1] - p_mid_B[1]) < 0.045:
+                                mid_pick_pt[0], mid_pick_pt[1] = pb_chk[0], pb_chk[1]
+                                if pe_chk is not None: mid_pick_ed = pe_chk
+                                break
+
                 ok = execute_subtask_pick_place(
                     arm_id="arm_b",
-                    p_pick_base=p_mid_B,
+                    p_pick_base=mid_pick_pt,
                     p_place_base=p_init_B,
+                    pick_edge_dir=mid_pick_ed,
+                    place_edge_dir=edge_init_B if edge_init_B is not None else np.array([1.0, 0.0, 0.0]),
+                    cube_top_z_ref=top_z_B,
+                    cube_key="A",
                     is_stack_place=False,
                     is_stack_pick=False
                 )
@@ -1398,9 +1562,13 @@ def run_cube_swap_workflow(target_step="all"):
                     return
                 with state.lock:
                     state.swap_workflow_step = 4
+                    state.anchors_locked = False # 完整流程全部结束，允许后续重新锁定新位置
                 state.add_log("🏆 [阶段 4/4] 双方块【堆叠与空间互换】全流程圆满成功完成！")
 
-        state.swap_workflow_status = "工作流完成 (双方块空间互换已实现)"
+        if state.swap_workflow_step == 4:
+            state.swap_workflow_status = "🎉 工作流完成 (双方块空间互换已实现)"
+        else:
+            state.swap_workflow_status = f"暂停于第 {state.swap_workflow_step}/4 步 (初始记忆已安全锁定，可继续下一步)"
     except Exception as e:
         state.add_log(f"🔴 工作流异常: {e}")
     finally:
@@ -1499,9 +1667,9 @@ class VisualHttpHandler(BaseHTTPRequestHandler):
                 ref_arm = state.get_world_ref_arm()
                 if cfg.get("T_baseA_baseB") is not None and MODE == 'dual':
                     t_ab = np.array(cfg["T_baseA_baseB"], dtype=float)[:3, 3]
-                    traj_center = [160.0, round(float(t_ab[1]) * 500.0, 1), 0.0]
+                    traj_center = [240.0, round(float(t_ab[1]) * 500.0, 1), 0.0]
                 else:
-                    traj_center = [220.0, 0.0 if ref_arm != "arm_a" else 260.0, 0.0]
+                    traj_center = [240.0, 0.0 if ref_arm != "arm_a" else -260.0, 0.0]
 
                 cal_arm = PRIMARY_ARM if MODE == 'single' else state.calib_target_arm
                 calib_arms = {
@@ -1557,6 +1725,7 @@ class VisualHttpHandler(BaseHTTPRequestHandler):
                     "swap_workflow": {
                         "busy": state.swap_workflow_busy,
                         "step": state.swap_workflow_step,
+                        "anchors_locked": state.anchors_locked,
                         "status": state.swap_workflow_status
                     },
                     "has_dual_rel_tf": (cfg.get("T_baseA_baseB") is not None),
@@ -1572,6 +1741,8 @@ class VisualHttpHandler(BaseHTTPRequestHandler):
                     "traj_3d": {
                         "points": list(state.traj_points),
                         "curr": state.traj_curr,
+                        "a": {"points": list(state.traj_a_points), "curr": state.traj_a_curr},
+                        "b": {"points": list(state.traj_b_points), "curr": state.traj_b_curr},
                         "center": traj_center,
                     },
                 }
@@ -1606,11 +1777,14 @@ class VisualHttpHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == '/api/workflow/reset_anchors':
             with state.lock:
-                state.cubes["A"]["init_p_base"] = None
-                state.cubes["B"]["init_p_base"] = None
+                state.anchors_locked = False
+                for ck in ("A", "B"):
+                    state.cubes[ck]["init_p_base"] = None
+                    state.cubes[ck]["init_p_cam"] = None
+                    state.cubes[ck]["init_edge_dir"] = None
                 state.swap_workflow_step = 0
                 state.swap_workflow_status = "待命 (请将方块A置于左侧，方块B置于右侧)"
-            state.add_log("🔄 已重置双方块初始位姿记忆与步进状态！")
+            state.add_log("🔄 已解锁并重置双方块初始位姿记忆与步进状态！")
             self._send_json({"status": "ok"})
 
         elif parsed.path == '/api/start_camera':
@@ -1630,6 +1804,12 @@ class VisualHttpHandler(BaseHTTPRequestHandler):
                 state.traj_points.clear()
                 if state.traj_curr is not None:
                     state.traj_points.append(state.traj_curr)
+                state.traj_a_points.clear()
+                if state.traj_a_curr is not None:
+                    state.traj_a_points.append(state.traj_a_curr)
+                state.traj_b_points.clear()
+                if state.traj_b_curr is not None:
+                    state.traj_b_points.append(state.traj_b_curr)
             self._send_json({"status": "ok"})
 
         elif parsed.path == '/api/reconnect_arms':

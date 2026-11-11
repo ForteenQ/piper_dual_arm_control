@@ -60,11 +60,37 @@ def piper_all_links_fk(q, tip_offset_z=0.136):
     return links, T6, T_tip
 
 
+def choose_best_cube_x_dir(theta_arm: float, raw_edge_dir=None):
+    """
+    针对正方形方块（90° 四重旋转对称），从两条正交边缘及其反方向中选择
+    使得手腕关节 J6 转动角度绝对值最小（<= 45°）的最优对齐向量，确保夹爪正夹方块平行侧面
+    """
+    if raw_edge_dir is None:
+        e1 = np.array([1.0, 0.0, 0.0])
+    else:
+        v = np.array([float(raw_edge_dir[0]), float(raw_edge_dir[1]), 0.0])
+        n = np.linalg.norm(v)
+        e1 = v / n if n > 1e-4 else np.array([1.0, 0.0, 0.0])
+    e2 = np.array([-e1[1], e1[0], 0.0])
+    cands = [e1, -e1, e2, -e2]
+    default_dir = np.array([-math.cos(theta_arm), -math.sin(theta_arm), 0.0])
+    return max(cands, key=lambda c: float(np.dot(c, default_dir)))
+
+
 def solve_hover_ik(target_tip_pos, target_x_dir=None, q_init=None):
-    """求解末端严格垂直向下、并对齐目标横向边缘的逆解"""
+    """求解末端严格垂直向下、并精准旋转 J6 对齐目标横向边缘的逆解"""
     theta = math.atan2(target_tip_pos[1], target_tip_pos[0])
+    j6_guess = 0.0
+    if target_x_dir is not None:
+        phi = math.atan2(float(target_x_dir[1]), float(target_x_dir[0]))
+        # j6=0 时 X 轴角为 theta + pi，因此需转动 j6 = wrap(theta + pi - phi)
+        diff = (theta + math.pi - phi + math.pi) % (2.0 * math.pi) - math.pi
+        if abs(diff) > math.pi / 2.0:
+            diff = (diff + math.pi) % (2.0 * math.pi) - math.pi
+        j6_guess = max(-2.0, min(2.0, diff))
+
     if q_init is None:
-        q_init = np.array([theta, 0.9, -1.1, 0.0, 0.9, 0.0])
+        q_init = np.array([theta, 0.9, -1.1, 0.0, 0.9, j6_guess])
     target_z = np.array([0.0, 0.0, -1.0])
 
     def loss(q):
@@ -72,12 +98,12 @@ def solve_hover_ik(target_tip_pos, target_x_dir=None, q_init=None):
         # 位置误差赋予绝对高权重 (保证指尖落点误差 < 0.2mm)
         pos_err = np.sum((T_tip[:3, 3] - target_tip_pos) ** 2) * 200000.0
         # 姿态尽量垂直向下，当接近 j5 极限时允许微倾斜几度以保全 100% 位置精度
-        rot_z_err = np.sum((T6[:3, 2] - target_z) ** 2) * 20.0
+        rot_z_err = np.sum((T6[:3, 2] - target_z) ** 2) * 25.0
         rot_x_err = 0.0
         if target_x_dir is not None:
             dot_x = np.dot(T6[:3, 0], target_x_dir)
-            rot_x_err = (1.0 - abs(dot_x)) * 2.0
-        reg = 0.02 * (q[3] ** 2) + 0.005 * (q[5] ** 2)
+            rot_x_err = (1.0 - abs(dot_x)) * 25.0
+        reg = 0.02 * (q[3] ** 2) + 0.002 * (q[5] ** 2)
         return pos_err + rot_z_err + rot_x_err + reg
 
     res = minimize(loss, q_init, method='SLSQP', bounds=BOUNDS, options={'maxiter': 500, 'ftol': 1e-8})
