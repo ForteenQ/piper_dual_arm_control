@@ -441,7 +441,8 @@ class DualArmVisualWorkerNode(Node):
         state.record_cube_3d_point(p_world, tz, is_tag_top=False)
 
     def process_frame(self, frame):
-        display = frame.copy()
+        # 响应用户需求：将画面翻转 180 度。在翻转后的图像上统一绘制标注与文字，确保文字方向正立、易读
+        display = cv2.rotate(frame, cv2.ROTATE_180)
         with state.lock:
             state.last_img_time = time.time()
             K = state.camera_matrix
@@ -467,9 +468,15 @@ class DualArmVisualWorkerNode(Node):
 
             det = self.detector.detect(frame, K, D, depth)
             if det is not None:
-                tc_draw = det["corners"].reshape((1, 4, 2)).astype(np.float32)
-                cv2.aruco.drawDetectedMarkers(display, [tc_draw], np.array([[det["id"]]]))
-                cv2.drawFrameAxes(display, K, D, det["rvec"], det["tvec_pnp"], TAG_SIZE_M * 0.8)
+                # 将角点映射到 180 度翻转图像系绘制标定框与局部坐标轴
+                raw_corners = det["corners"].reshape((4, 2))
+                tc_rot = np.zeros_like(raw_corners, dtype=np.float32)
+                tc_rot[:, 0] = 639.0 - raw_corners[:, 0]
+                tc_rot[:, 1] = 479.0 - raw_corners[:, 1]
+                cv2.polylines(display, [tc_rot.astype(np.int32)], True, (0, 255, 0), 2)
+                # 画出对角交叉或中心点
+                c_center = tuple(tc_rot.mean(axis=0).astype(int))
+                cv2.circle(display, c_center, 4, (0, 0, 255), -1)
 
                 p_cam = det["p_cam"]
                 with state.lock:
@@ -492,7 +499,7 @@ class DualArmVisualWorkerNode(Node):
                         np.array([smooth_cam[0], smooth_cam[1], 0.515 - smooth_cam[2]]), 0.0, is_tag_top=True
                     )
 
-                cx_px, cy_px = int(det["uv"][0]), int(det["uv"][1])
+                cx_px, cy_px = 639 - int(det["uv"][0]), 479 - int(det["uv"][1])
                 if MODE == 'single':
                     ps, _ = state.transform_cam_to_arm(PRIMARY_ARM, smooth_cam)
                     txt = (f"ID:{det['id']} ({ps[0]*1000:.0f},{ps[1]*1000:.0f},{ps[2]*1000:.0f})"
@@ -512,7 +519,7 @@ class DualArmVisualWorkerNode(Node):
             else:
                 self._update_3d_trajectory_from_state()
 
-            # 绘制标定采样点 C1..CN
+            # 绘制标定采样点 C1..CN (坐标经 180度翻转匹配显示画面)
             show_calib_arms = [PRIMARY_ARM] if MODE == 'single' else ["arm_a", "arm_b"]
             for aid_c in show_calib_arms:
                 pts_c = state.calib_points.get(aid_c, [])
@@ -521,7 +528,7 @@ class DualArmVisualWorkerNode(Node):
                     pc = np.array(cp["p_cam"], dtype=float)
                     if pc[2] > 0.05:
                         uv2, _ = cv2.projectPoints(pc.reshape(1, 1, 3), np.zeros(3), np.zeros(3), K, D)
-                        pu, pv = int(round(uv2[0, 0, 0])), int(round(uv2[0, 0, 1]))
+                        pu, pv = 639 - int(round(uv2[0, 0, 0])), 479 - int(round(uv2[0, 0, 1]))
                         cv2.circle(display, (pu, pv), 6, col_c, 2)
                         lbl = f"C{idx+1}" if MODE == 'single' else f"{aid_c[-1].upper()}{idx+1}"
                         cv2.putText(display, lbl, (pu + 7, pv - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col_c, 1)
@@ -531,7 +538,8 @@ class DualArmVisualWorkerNode(Node):
                 state.tag_detected = False
 
         if c_uv is not None:
-            u, v = c_uv
+            raw_cu, raw_cv = c_uv
+            u, v = 639 - raw_cu, 479 - raw_cv
             if MODE == 'single':
                 valid_any = c_eval.get(PRIMARY_ARM, {}).get("valid", False)
                 t_lbl = "TARGET" if valid_any else "OUT OF RANGE"
@@ -546,9 +554,6 @@ class DualArmVisualWorkerNode(Node):
             if c_cam is not None:
                 cv2.putText(display, t_lbl, (min(460, u + 16), max(25, v - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
-
-        # 响应用户需求：将网页中展示的摄像头画面旋转 180 度，方便操作者直观对照实物桌面
-        display = cv2.rotate(display, cv2.ROTATE_180)
 
         _, jpeg = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 75])
         with state.lock:

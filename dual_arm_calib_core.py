@@ -254,7 +254,8 @@ def draw_arm_ar_overlay(display: np.ndarray, arm_label: str, T_base_cam: np.ndar
         if pc[2] <= 0.08:
             return None
         pts2d, _ = cv2.projectPoints(pc.reshape(1, 1, 3), np.zeros(3), np.zeros(3), K, D)
-        u, v = int(round(pts2d[0, 0, 0])), int(round(pts2d[0, 0, 1]))
+        # 匹配 180度旋转显示系
+        u, v = 639 - int(round(pts2d[0, 0, 0])), 479 - int(round(pts2d[0, 0, 1]))
         if -400 <= u <= 1040 and -400 <= v <= 880:
             return (u, v)
         return None
