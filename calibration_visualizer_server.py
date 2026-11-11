@@ -176,7 +176,13 @@ class DualArmSystemState:
         self.selected_arm_mode = PRIMARY_ARM if MODE == 'single' else "auto"
         self.task_busy = False
         self.task_status = "空闲待命 (随时可执行任务)"
-        self.task_logs = collections.deque(maxlen=40)
+        self.task_logs = collections.deque(maxlen=25)
+
+    def get_arm_speed_factor(self, arm_id: str) -> float:
+        """全局通用速度系数 (由前端滑块 20%~150% 动态调节)"""
+        with self.lock:
+            pct = float(self.config["arms"].get(arm_id, {}).get("speed_pct", 100))
+        return max(0.2, min(1.8, pct / 100.0))
 
     @staticmethod
     def _init_arm_runtime():
@@ -530,134 +536,179 @@ class DualArmVisualWorkerNode(Node):
                     tz = float(cfg["arms"][aid].get("table_z_base", -0.005))
                     draw_arm_ar_overlay(display, label, T_bc, K, D, tz, c_main, c_arc)
 
-            # 多标靶视觉检测：支持双方块 (方块A在左，方块B在右) 同时跟踪与状态机锁定
-            all_dets = self.detector.detect_all(frame, K, D, depth)
             now_t = time.time()
-
-            if len(all_dets) > 0:
-                self.last_detect_time = now_t
-                # 按 180度翻转后画面的水平坐标 u_rot (从左到右) 排序
-                for d in all_dets:
-                    raw_corners = d["corners"].reshape((4, 2))
+            if MODE == 'single':
+                # 单臂演示台：保持纯单标靶识别与追踪，绝不混入双臂标签
+                det = self.detector.detect(frame, K, D, depth)
+                if det is not None:
+                    self.last_detect_time = now_t
+                    raw_corners = det["corners"].reshape((4, 2))
                     tc_rot = np.zeros_like(raw_corners, dtype=np.float32)
                     tc_rot[:, 0] = 639.0 - raw_corners[:, 0]
                     tc_rot[:, 1] = 479.0 - raw_corners[:, 1]
-                    d["tc_rot"] = tc_rot
-                    d["u_rot"] = float(tc_rot[:, 0].mean())
-                    d["v_rot"] = float(tc_rot[:, 1].mean())
-
-                all_dets.sort(key=lambda x: x["u_rot"])
-
-                det_a, det_b = None, None
-                if len(all_dets) >= 2:
-                    det_a = all_dets[0]  # 最左侧为方块 A
-                    det_b = all_dets[-1] # 最右侧为方块 B
-                else:
-                    d_single = all_dets[0]
-                    with state.lock:
-                        c_cube = state.carrying_cube
-                        init_a = state.cubes["A"]["init_p_cam"]
-                        init_b = state.cubes["B"]["init_p_cam"]
-                    if c_cube == "A":
-                        det_b = d_single
-                    elif c_cube == "B":
-                        det_a = d_single
-                    elif init_a is not None and init_b is not None:
-                        dist_a = np.linalg.norm(d_single["p_cam"] - init_a)
-                        dist_b = np.linalg.norm(d_single["p_cam"] - init_b)
-                        if dist_a < dist_b:
-                            det_a = d_single
-                        else:
-                            det_b = d_single
-                    else:
-                        if d_single["u_rot"] < 320.0:
-                            det_a = d_single
-                        else:
-                            det_b = d_single
-
-                ref_arm = state.get_world_ref_arm()
-                ref_tz = float(cfg["arms"][ref_arm].get("table_z_base", -0.005))
-
-                # 分别更新与渲染方块 A 和方块 B
-                for cube_key, det_obj, color_box, label_name in [
-                    ("A", det_a, (255, 230, 0), "CUBE A (Left)"),
-                    ("B", det_b, (255, 100, 255), "CUBE B (Right)"),
-                ]:
-                    if det_obj is None:
-                        with state.lock:
-                            if now_t - state.cubes[cube_key]["last_seen"] > 0.6:
-                                state.cubes[cube_key]["detected"] = False
-                        continue
-
-                    tc_rot = det_obj["tc_rot"]
-                    cv2.polylines(display, [tc_rot.astype(np.int32)], True, color_box, 2)
-                    c_center = (int(round(det_obj["u_rot"])), int(round(det_obj["v_rot"])))
+                    cv2.polylines(display, [tc_rot.astype(np.int32)], True, (0, 255, 0), 2)
+                    c_center = tuple(tc_rot.mean(axis=0).astype(int))
                     cv2.circle(display, c_center, 4, (0, 0, 255), -1)
 
-                    p_cam = det_obj["p_cam"]
-                    target_arm = "arm_a" if cube_key == "A" else "arm_b"
-
+                    p_cam = det["p_cam"]
                     with state.lock:
-                        c_dict = state.cubes[cube_key]
-                        c_dict["history"].append(p_cam)
-                        smooth_cam = np.median(np.array(c_dict["history"]), axis=0)
-                        c_dict["detected"] = True
-                        c_dict["id"] = det_obj["id"]
-                        c_dict["p_cam"] = smooth_cam
-                        c_dict["yaw_cam"] = det_obj["yaw_vec_cam"]
-                        c_dict["uv_rot"] = [det_obj["u_rot"], det_obj["v_rot"]]
-                        c_dict["last_seen"] = now_t
-
-                        # 计算本臂基座系坐标及边缘朝向
-                        p_base, edge_dir = state.transform_cam_to_arm(target_arm, smooth_cam, det_obj["yaw_vec_cam"])
-                        c_dict["p_base"] = p_base
-                        c_dict["edge_dir"] = edge_dir
-
-                        # 严格防覆写锁定：仅当未开始流程、未锁定且步骤为 0 时才自动标定初始锚点
-                        if not state.anchors_locked and not state.swap_workflow_busy and state.swap_workflow_step == 0:
-                            c_dict["init_p_cam"] = smooth_cam.copy()
-                            if p_base is not None:
-                                c_dict["init_p_base"] = p_base.copy()
-                            if edge_dir is not None:
-                                c_dict["init_edge_dir"] = edge_dir.copy()
-
-                        # 兼顾原有全局单标靶接口
+                        state.tag_cam_history.append(p_cam)
+                        smooth_cam = np.median(np.array(state.tag_cam_history), axis=0)
                         state.tag_detected = True
-                        state.tag_id = det_obj["id"]
+                        state.tag_id = det["id"]
                         state.tag_pos_cam = smooth_cam
-                        state.tag_yaw_cam = det_obj["yaw_vec_cam"]
+                        state.tag_yaw_cam = det["yaw_vec_cam"]
 
-                    # 将双方块各自真实坐标独立推送至 3D 质点轨迹器 (仅当未被机械臂夹走时用视觉更新，防止叠加误跳)
-                    if state.carrying_cube != cube_key:
-                        p_ref, _ = state.transform_cam_to_arm(ref_arm, smooth_cam)
-                        if p_ref is not None:
-                            state.record_cube_3d_point(p_ref, ref_tz, is_tag_top=True, cube_key=cube_key)
-                        else:
-                            state.record_cube_3d_point(
-                                np.array([smooth_cam[0], smooth_cam[1], 0.515 - smooth_cam[2]]), 0.0, is_tag_top=True, cube_key=cube_key
-                            )
-
-                    # 在 180度翻转后画面上直接绘制正立文本标注
-                    cx_px, cy_px = int(det_obj["u_rot"]), int(det_obj["v_rot"])
-                    if p_base is not None:
-                        txt_coord = f"{cube_key}:({p_base[0]*1000:.0f},{p_base[1]*1000:.0f},{p_base[2]*1000:.0f})mm"
+                    ref_arm = state.get_world_ref_arm()
+                    p_ref, _ = state.transform_cam_to_arm(ref_arm, smooth_cam)
+                    if p_ref is not None:
+                        tz = float(cfg["arms"][ref_arm].get("table_z_base", -0.005))
+                        state.record_cube_3d_point(p_ref, tz, is_tag_top=True, cube_key=None)
                     else:
-                        txt_coord = f"CAM:({smooth_cam[0]*1000:.0f},{smooth_cam[1]*1000:.0f},{smooth_cam[2]*1000:.0f})mm"
+                        state.record_cube_3d_point(
+                            np.array([smooth_cam[0], smooth_cam[1], 0.515 - smooth_cam[2]]), 0.0, is_tag_top=True, cube_key=None
+                        )
 
-                    cv2.putText(display, f"[{label_name}]", (max(10, cx_px - 85), max(22, cy_px - 26)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, color_box, 2)
-                    cv2.putText(display, txt_coord, (max(10, cx_px - 85), max(40, cy_px - 8)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1)
-
-                # 若此时有臂正在搬运遮挡方块，继续用运动学推演更新被抓走的那块方块的 3D 质点
-                if state.carrying_arm is not None:
-                    self._update_3d_trajectory_from_state()
+                    cx_px, cy_px = 639 - int(det["uv"][0]), 479 - int(det["uv"][1])
+                    ps, _ = state.transform_cam_to_arm(PRIMARY_ARM, smooth_cam)
+                    txt = (f"ID:{det['id']} ({ps[0]*1000:.0f},{ps[1]*1000:.0f},{ps[2]*1000:.0f})"
+                           if ps is not None else
+                           f"ID:{det['id']} CAM:({smooth_cam[0]*1000:.0f},{smooth_cam[1]*1000:.0f},{smooth_cam[2]*1000:.0f})")
+                    cv2.putText(display, txt, (max(10, cx_px - 95), max(25, cy_px - 20)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 2)
+                else:
+                    if state.carrying_arm is not None:
+                        self._update_3d_trajectory_from_state()
+                    elif now_t - self.last_detect_time > 0.6:
+                        with state.lock:
+                            state.traj_curr = None
             else:
-                with state.lock:
-                    for ck in ("A", "B"):
-                        if now_t - state.cubes[ck]["last_seen"] > 0.6:
-                            state.cubes[ck]["detected"] = False
-                self._update_3d_trajectory_from_state()
+                # 双臂模式：多标靶视觉检测 (左侧方块A，右侧方块B)
+                all_dets = self.detector.detect_all(frame, K, D, depth)
+
+                if len(all_dets) > 0:
+                    self.last_detect_time = now_t
+                    for d in all_dets:
+                        raw_corners = d["corners"].reshape((4, 2))
+                        tc_rot = np.zeros_like(raw_corners, dtype=np.float32)
+                        tc_rot[:, 0] = 639.0 - raw_corners[:, 0]
+                        tc_rot[:, 1] = 479.0 - raw_corners[:, 1]
+                        d["tc_rot"] = tc_rot
+                        d["u_rot"] = float(tc_rot[:, 0].mean())
+                        d["v_rot"] = float(tc_rot[:, 1].mean())
+
+                    all_dets.sort(key=lambda x: x["u_rot"])
+
+                    det_a, det_b = None, None
+                    if len(all_dets) >= 2:
+                        det_a = all_dets[0]  # 最左侧为方块 A
+                        det_b = all_dets[-1] # 最右侧为方块 B
+                    else:
+                        d_single = all_dets[0]
+                        with state.lock:
+                            c_cube = state.carrying_cube
+                            init_a = state.cubes["A"]["init_p_cam"]
+                            init_b = state.cubes["B"]["init_p_cam"]
+                        if c_cube == "A":
+                            det_b = d_single
+                        elif c_cube == "B":
+                            det_a = d_single
+                        elif init_a is not None and init_b is not None:
+                            dist_a = np.linalg.norm(d_single["p_cam"] - init_a)
+                            dist_b = np.linalg.norm(d_single["p_cam"] - init_b)
+                            if dist_a < dist_b:
+                                det_a = d_single
+                            else:
+                                det_b = d_single
+                        else:
+                            if d_single["u_rot"] < 320.0:
+                                det_a = d_single
+                            else:
+                                det_b = d_single
+
+                    ref_arm = state.get_world_ref_arm()
+                    ref_tz = float(cfg["arms"][ref_arm].get("table_z_base", -0.005))
+
+                    for cube_key, det_obj, color_box, label_name in [
+                        ("A", det_a, (255, 230, 0), "CUBE A (Left)"),
+                        ("B", det_b, (255, 100, 255), "CUBE B (Right)"),
+                    ]:
+                        if det_obj is None:
+                            with state.lock:
+                                if now_t - state.cubes[cube_key]["last_seen"] > 0.6:
+                                    state.cubes[cube_key]["detected"] = False
+                                    if state.carrying_cube != cube_key:
+                                        if cube_key == "A": state.traj_a_curr = None
+                                        else: state.traj_b_curr = None
+                            continue
+
+                        tc_rot = det_obj["tc_rot"]
+                        cv2.polylines(display, [tc_rot.astype(np.int32)], True, color_box, 2)
+                        c_center = (int(round(det_obj["u_rot"])), int(round(det_obj["v_rot"])))
+                        cv2.circle(display, c_center, 4, (0, 0, 255), -1)
+
+                        p_cam = det_obj["p_cam"]
+                        target_arm = "arm_a" if cube_key == "A" else "arm_b"
+
+                        with state.lock:
+                            c_dict = state.cubes[cube_key]
+                            c_dict["history"].append(p_cam)
+                            smooth_cam = np.median(np.array(c_dict["history"]), axis=0)
+                            c_dict["detected"] = True
+                            c_dict["id"] = det_obj["id"]
+                            c_dict["p_cam"] = smooth_cam
+                            c_dict["yaw_cam"] = det_obj["yaw_vec_cam"]
+                            c_dict["uv_rot"] = [det_obj["u_rot"], det_obj["v_rot"]]
+                            c_dict["last_seen"] = now_t
+
+                            p_base, edge_dir = state.transform_cam_to_arm(target_arm, smooth_cam, det_obj["yaw_vec_cam"])
+                            c_dict["p_base"] = p_base
+                            c_dict["edge_dir"] = edge_dir
+
+                            if not state.anchors_locked and not state.swap_workflow_busy and state.swap_workflow_step == 0:
+                                c_dict["init_p_cam"] = smooth_cam.copy()
+                                if p_base is not None:
+                                    c_dict["init_p_base"] = p_base.copy()
+                                if edge_dir is not None:
+                                    c_dict["init_edge_dir"] = edge_dir.copy()
+
+                            state.tag_detected = True
+                            state.tag_id = det_obj["id"]
+                            state.tag_pos_cam = smooth_cam
+                            state.tag_yaw_cam = det_obj["yaw_vec_cam"]
+
+                        if state.carrying_cube != cube_key:
+                            p_ref, _ = state.transform_cam_to_arm(ref_arm, smooth_cam)
+                            if p_ref is not None:
+                                state.record_cube_3d_point(p_ref, ref_tz, is_tag_top=True, cube_key=cube_key)
+                            else:
+                                state.record_cube_3d_point(
+                                    np.array([smooth_cam[0], smooth_cam[1], 0.515 - smooth_cam[2]]), 0.0, is_tag_top=True, cube_key=cube_key
+                                )
+
+                        cx_px, cy_px = int(det_obj["u_rot"]), int(det_obj["v_rot"])
+                        if p_base is not None:
+                            txt_coord = f"{cube_key}:({p_base[0]*1000:.0f},{p_base[1]*1000:.0f},{p_base[2]*1000:.0f})mm"
+                        else:
+                            txt_coord = f"CAM:({smooth_cam[0]*1000:.0f},{smooth_cam[1]*1000:.0f},{smooth_cam[2]*1000:.0f})mm"
+
+                        cv2.putText(display, f"[{label_name}]", (max(10, cx_px - 85), max(22, cy_px - 26)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, color_box, 2)
+                        cv2.putText(display, txt_coord, (max(10, cx_px - 85), max(40, cy_px - 8)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1)
+
+                    if state.carrying_arm is not None:
+                        self._update_3d_trajectory_from_state()
+                else:
+                    with state.lock:
+                        for ck in ("A", "B"):
+                            if now_t - state.cubes[ck]["last_seen"] > 0.6:
+                                state.cubes[ck]["detected"] = False
+                                if state.carrying_cube != ck:
+                                    if ck == "A": state.traj_a_curr = None
+                                    else: state.traj_b_curr = None
+                    if state.carrying_arm is not None:
+                        self._update_3d_trajectory_from_state()
 
             # 绘制标定采样点 C1..CN (坐标经 180度翻转匹配显示画面)
             show_calib_arms = [PRIMARY_ARM] if MODE == 'single' else ["arm_a", "arm_b"]
@@ -955,10 +1006,11 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
         state.add_log(f"🔴 [{arm_id}] 碰撞拦截: {smsg}")
         return False
 
-    # === 实机执行序列 ===
+    # === 实机执行序列 (全程实时响应全局通用速度滑块) ===
     try:
         # 1. 抓取前预备：立即张开夹爪至 55mm (充分敞开)
-        state.add_log(f"👐 [{arm_id.upper()}] 预抓取准备: 展开夹爪至 55mm (速率:{int(spd_pct)}%)...")
+        spd_f = state.get_arm_speed_factor(arm_id)
+        state.add_log(f"👐 [{arm_id.upper()}] 预抓取准备: 展开夹爪至 55mm (全局速率:{int(spd_f*100)}%)...")
         node.send_gripper(arm_id, 55.0, effort)
 
         if not node.send_trajectory(arm_id, [q_ready, q_pre], 4.2 / spd_f):
@@ -966,7 +1018,6 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
             return False
 
         # 核心防撞安全阻塞：在下探前严格校验夹爪是否已充分张开 (>= 42mm)
-        # 解决断电重启后第一次抓取夹爪未提前张开导致顶压方块的隐患
         t_wait_open = time.time()
         while time.time() - t_wait_open < 1.5:
             with state.lock:
@@ -976,6 +1027,7 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
             node.send_gripper(arm_id, 55.0, effort)
             time.sleep(0.12)
 
+        spd_f = state.get_arm_speed_factor(arm_id)
         if not node.send_trajectory(arm_id, wp_down, 3.0 / spd_f):
             state.add_log(f"❌ [{arm_id}] 垂直下探失败")
             return False
@@ -986,31 +1038,37 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
         with state.lock:
             state.carrying_arm = arm_id
 
+        spd_f = state.get_arm_speed_factor(arm_id)
         if not node.send_trajectory(arm_id, wp_lift, 2.2 / spd_f):
             return False
         time.sleep(0.3)
 
         if mode == 'place' and wp_pl_down is not None:
+            spd_f = state.get_arm_speed_factor(arm_id)
             state.add_log(f"✈️ [{arm_id}] 搬运前往目标点...")
             if not node.send_trajectory(arm_id, [q_pl_above], 3.8 / spd_f):
                 return False
+            spd_f = state.get_arm_speed_factor(arm_id)
             if not node.send_trajectory(arm_id, wp_pl_down, 2.8 / spd_f):
                 return False
             with state.lock:
                 state.carrying_arm = None
-            node.send_gripper(arm_id, 50.0, effort)
+            node.send_gripper(arm_id, 55.0, effort)
             time.sleep(0.6)
+            spd_f = state.get_arm_speed_factor(arm_id)
             node.send_trajectory(arm_id, wp_pl_up, 2.0 / spd_f)
             q_ret_from = wp_pl_up[-1]
         else:
+            spd_f = state.get_arm_speed_factor(arm_id)
             state.add_log(f"⏬ [{arm_id}] 原地放回...")
             wp_ret_dn, _ = solve_cartesian_segment(wp_lift[-1], p_lift, p_grasp, R_grasp, num_steps=10)
             if wp_ret_dn:
                 node.send_trajectory(arm_id, wp_ret_dn, 2.6 / spd_f)
             with state.lock:
                 state.carrying_arm = None
-            node.send_gripper(arm_id, 50.0, effort)
+            node.send_gripper(arm_id, 55.0, effort)
             time.sleep(0.6)
+            spd_f = state.get_arm_speed_factor(arm_id)
             wp_ret_up, _ = solve_cartesian_segment(
                 wp_ret_dn[-1] if wp_ret_dn else wp_lift[-1], p_grasp, p_lift, R_grasp, num_steps=6
             )
@@ -1018,6 +1076,7 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
                 node.send_trajectory(arm_id, wp_ret_up, 1.8 / spd_f)
             q_ret_from = wp_ret_up[-1] if wp_ret_up else wp_lift[-1]
 
+        spd_f = state.get_arm_speed_factor(arm_id)
         state.add_log(f"🏠 [{arm_id}] 安全退回待命折叠原点...")
         q_home = get_home_joints_rad()
         theta_cur = float(q_ret_from[0])
@@ -1135,6 +1194,32 @@ def run_task_worker(mode='return', target_cam_pos=None, arm_mode_override=None):
             state.task_busy = False
 
 
+def get_safe_yield_pose(arm_id: str) -> np.ndarray:
+    """获取各机械臂向外侧偏转的安全避让待命姿态 (远离中间公共区 > 815mm，对侧臂绝对触及不到)"""
+    if arm_id == "arm_a":
+        # A 臂在左侧，向自身 +Y (左外侧 +54°) 安全悬停避让
+        return np.array([0.95, 0.45, -0.75, 0.0, 0.50, 0.0], dtype=float)
+    else:
+        # B 臂在右侧，向自身 -Y (右外侧 -54°) 安全悬停避让
+        return np.array([-0.95, 0.45, -0.75, 0.0, 0.50, 0.0], dtype=float)
+
+
+def ensure_arm_yielded(arm_id: str):
+    """确保指定机械臂已位于外侧安全避让区 (不退回 Home 原位，只需移至另一臂触及不到的外侧)"""
+    with state.lock:
+        rt = state.arm_runtime[arm_id]
+        if not rt["motors_alive"] or rt["joints"] is None:
+            return
+        q_curr = rt["joints"].copy()
+    q_yield = get_safe_yield_pose(arm_id)
+    # 若已处于外侧安全位置附近则无需动作
+    if float(np.max(np.abs(q_curr[:3] - q_yield[:3]))) < 0.25:
+        return
+    spd_f = state.get_arm_speed_factor(arm_id)
+    state.add_log(f"🛡️ [{arm_id.upper()}] 正在让位至外侧安全待命区 (距对侧>81cm，无需回原位)...")
+    worker_node.send_trajectory(arm_id, [q_yield], 2.6 / spd_f)
+
+
 def run_retract_home_worker(arm_id="all"):
     with state.lock:
         if state.task_busy:
@@ -1148,14 +1233,16 @@ def run_retract_home_worker(arm_id="all"):
                 rt = state.arm_runtime[aid]
                 alive = rt["motors_alive"]
                 q_curr = rt["joints"]
+                effort = int(state.config["arms"][aid].get("grasp_effort", 350))
             if not alive or q_curr is None:
                 continue
+            spd_f = state.get_arm_speed_factor(aid)
             T_bc = state.get_arm_T_base_cam(aid)
             cam_pos = T_bc[:3, 3] if T_bc is not None else None
-            state.add_log(f"🏠 [{aid.upper()}] 正在退回安全折叠原点...")
+            state.add_log(f"🏠 [{aid.upper()}] 正在退回安全折叠原点 (速率:{int(spd_f*100)}%)...")
             q_mid = choose_safe_ready_pose(float(q_curr[0]), q_curr, q_home, cam_pos)
-            worker_node.send_trajectory(aid, [q_mid, q_home], 3.8)
-            worker_node.send_gripper(aid, 0.0, 350)
+            worker_node.send_trajectory(aid, [q_mid, q_home], 3.8 / spd_f)
+            worker_node.send_gripper(aid, 0.0, effort)
         state.add_log("✅ 安全折叠原点复位完成！")
     finally:
         with state.lock:
@@ -1168,20 +1255,18 @@ def run_retract_home_worker(arm_id="all"):
 def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_base: np.ndarray,
                                pick_edge_dir=None, place_edge_dir=None,
                                cube_top_z_ref: float = None, cube_key: str = "A",
-                               is_stack_place: bool = False, is_stack_pick: bool = False) -> bool:
+                               is_stack_place: bool = False, is_stack_pick: bool = False,
+                               retreat_home: bool = False) -> bool:
     """
-    通用高精度笛卡尔搬运原子动作，执行完毕后自动垂直抬升并安全折叠避让回 Home
-    - arm_id: "arm_a" 或 "arm_b"
-    - p_pick_base: 抓取点 (基座系 [x, y, z])
-    - p_place_base: 放置点 (基座系 [x, y, z])
-    - pick_edge_dir: 方块抓取时的边缘朝向向量 (用于转腕对齐平面，防止夹对角线)
-    - place_edge_dir: 放置时的目标朝向向量 (默认对齐桌面坐标轴 [1,0,0])
-    - cube_top_z_ref: 实测桌面底层方块顶面Z高度，用于反推真实局部桌面并实现 1.5mm 贴桌轻放
-    - cube_key: "A" 或 "B" (用于在 3D 质点视图中独立跟踪对应颜色质点)
-    - is_stack_place: 是否堆叠在现有方块上方 (+25mm)
-    - is_stack_pick: 是否抓取叠在顶层的方块 (+25mm)
+    通用高精度笛卡尔搬运原子动作
+    - 动作前自动校验对侧臂已停靠至外侧触碰不到的安全待命位
+    - 执行完毕后默认退回外侧安全避让位 (yield pose)，不再反复折回原点；最终步可选回 Home
+    - 全过程动态读取 speed_pct，实现全局通用速度控制
     """
     node = worker_node
+    other_arm = "arm_b" if arm_id == "arm_a" else "arm_a"
+    ensure_arm_yielded(other_arm)
+
     with state.lock:
         if state.abort_workflow_flag:
             state.add_log(f"🛑 [{arm_id}] 用户已请求中止当前动作")
@@ -1205,8 +1290,6 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
     z_off = float(arm_cfg.get("grasp_z_offset_mm", -25.5)) / 1000.0
     effort = int(arm_cfg.get("grasp_effort", 350))
     grip_w = float(arm_cfg.get("grasp_target_mm", 26.5))
-    spd_pct = float(arm_cfg.get("speed_pct", 100))
-    spd_f = max(0.2, min(1.8, spd_pct / 100.0))
 
     # 1. 精确反推局部真实桌面基准 Z (解决下放悬空 1-2cm 问题)
     # 已知标准方块高度为 25mm (0.025m)
@@ -1280,10 +1363,11 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
         state.add_log(f"🔴 [{arm_id}] 放置后抬升规划失败: {msg_pu}")
         return False
 
-    # 5. 执行动作序列
+    # 5. 执行动作序列 (全程动态响应全局通用速度滑块)
     try:
         if state.abort_workflow_flag: return False
-        state.add_log(f"👐 [{arm_id.upper()}] 提前张开夹爪至 55mm (速率:{int(spd_pct)}%)...")
+        spd_f = state.get_arm_speed_factor(arm_id)
+        state.add_log(f"👐 [{arm_id.upper()}] 提前张开夹爪至 55mm (全局速率:{int(spd_f*100)}%)...")
         node.send_gripper(arm_id, 55.0, effort)
 
         if not node.send_trajectory(arm_id, [q_ready, q_pre], 4.0 / spd_f):
@@ -1297,6 +1381,7 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
             time.sleep(0.1)
 
         if state.abort_workflow_flag: return False
+        spd_f = state.get_arm_speed_factor(arm_id)
         state.add_log(f"⬇️ [{arm_id.upper()}] 垂直下探对齐方块平面...")
         if not node.send_trajectory(arm_id, wp_down, 2.8 / spd_f):
             return False
@@ -1309,16 +1394,19 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
             state.carrying_cube = cube_key
 
         if state.abort_workflow_flag: return False
+        spd_f = state.get_arm_speed_factor(arm_id)
         state.add_log(f"⬆️ [{arm_id.upper()}] 垂直抬升...")
         if not node.send_trajectory(arm_id, wp_lift, 2.2 / spd_f):
             return False
 
         if state.abort_workflow_flag: return False
+        spd_f = state.get_arm_speed_factor(arm_id)
         state.add_log(f"✈️ [{arm_id.upper()}] 平移至目标上方并摆正...")
         if not node.send_trajectory(arm_id, [q_pl_above], 3.8 / spd_f):
             return False
 
         if state.abort_workflow_flag: return False
+        spd_f = state.get_arm_speed_factor(arm_id)
         state.add_log(f"⬇️ [{arm_id.upper()}] 贴近桌面垂直下探就位...")
         if not node.send_trajectory(arm_id, wp_pl_down, 2.8 / spd_f):
             return False
@@ -1330,15 +1418,23 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
         node.send_gripper(arm_id, 55.0, effort)
         time.sleep(0.7)
 
+        spd_f = state.get_arm_speed_factor(arm_id)
         state.add_log(f"⬆️ [{arm_id.upper()}] 垂直抬升脱离...")
         node.send_trajectory(arm_id, wp_pl_up, 2.2 / spd_f)
 
-        state.add_log(f"🏠 [{arm_id.upper()}] 安全缩回待命折叠原点 (彻底为另一臂让位)...")
-        q_home = get_home_joints_rad()
-        theta_exit = float(wp_pl_up[-1][0])
-        q_exit = choose_safe_ready_pose(theta_exit, wp_pl_up[-1], q_home, cam_pos)
-        node.send_trajectory(arm_id, [q_exit, q_home], 3.6 / spd_f)
-        node.send_gripper(arm_id, 0.0, effort)
+        spd_f = state.get_arm_speed_factor(arm_id)
+        if retreat_home:
+            state.add_log(f"🏠 [{arm_id.upper()}] 全流程完成，退回安全折叠原点...")
+            q_home = get_home_joints_rad()
+            theta_exit = float(wp_pl_up[-1][0])
+            q_exit = choose_safe_ready_pose(theta_exit, wp_pl_up[-1], q_home, cam_pos)
+            node.send_trajectory(arm_id, [q_exit, q_home], 3.6 / spd_f)
+            node.send_gripper(arm_id, 0.0, effort)
+        else:
+            q_yield = get_safe_yield_pose(arm_id)
+            state.add_log(f"🛡️ [{arm_id.upper()}] 退至外侧安全区等待 (无需回原点，距对侧>81cm)...")
+            node.send_trajectory(arm_id, [q_yield], 2.6 / spd_f)
+            node.send_gripper(arm_id, 0.0, effort)
         return True
     finally:
         with state.lock:
@@ -1555,7 +1651,8 @@ def run_cube_swap_workflow(target_step="all"):
                     cube_top_z_ref=top_z_B,
                     cube_key="A",
                     is_stack_place=False,
-                    is_stack_pick=False
+                    is_stack_pick=False,
+                    retreat_home=True
                 )
                 if not ok:
                     state.add_log("❌ [阶段 4/4] 执行失败，已安全中止")
@@ -1669,7 +1766,7 @@ class VisualHttpHandler(BaseHTTPRequestHandler):
                     t_ab = np.array(cfg["T_baseA_baseB"], dtype=float)[:3, 3]
                     traj_center = [240.0, round(float(t_ab[1]) * 500.0, 1), 0.0]
                 else:
-                    traj_center = [240.0, 0.0 if ref_arm != "arm_a" else -260.0, 0.0]
+                    traj_center = [240.0, -50.0 if ref_arm == "arm_a" else 50.0, 0.0]
 
                 cal_arm = PRIMARY_ARM if MODE == 'single' else state.calib_target_arm
                 calib_arms = {

@@ -533,8 +533,9 @@ def render_single_arm_html() -> str:
           <div class="fps-badge" id="fps-indicator">SYNC...</div>
         </div>
         <div class="tip-banner">
-          <span>💡 点击画面绿桌面任意空白处即可设定目标准星 🎯</span>
-          <button class="btn-slate btn-sm" onclick="postApi('/api/clear_point')">清除选点</button>
+          <span>💡 左键点击绿桌面设定目标 · 右键点击或按右侧按钮清除 🎯</span>
+          <button class="btn-red btn-sm" id="btn-clear-pt" onclick="postApi('/api/clear_point')" style="display:none;">❌ 消除目标点</button>
+          <button class="btn-slate btn-sm" id="btn-clear-pt-idle" onclick="postApi('/api/clear_point')">消除目标点</button>
         </div>
       </div>
 
@@ -582,7 +583,10 @@ def render_single_arm_html() -> str:
         <div class="box row-between"><span>方块基座坐标 (X, Y, Z):</span><span class="mono" id="st-tag-pos">--</span></div>
         <div class="box row-between"><span>夹爪实时物理开度:</span><span class="mono" id="st-grip">0.0 mm</span></div>
         <div class="box">
-          <div style="color:#94a3b8; font-size:11.5px; margin-bottom:2px;">🎯 鼠标点击的目标放置点评估:</div>
+          <div class="row-between" style="margin-bottom:2px;">
+            <span style="color:#94a3b8; font-size:11.5px;">🎯 鼠标点击的目标放置点评估:</span>
+            <button class="btn-slate btn-sm" style="padding:1px 6px; font-size:10.5px;" onclick="postApi('/api/clear_point')">❌ 消除</button>
+          </div>
           <div class="mono" id="st-click" style="font-size:12px; color:#facc15;">请点击左侧桌面空白位置</div>
         </div>
 
@@ -651,7 +655,8 @@ def render_single_arm_html() -> str:
 
 <script>
 ''' + TRAJ_3D_SCRIPT + r'''
-  const viewer3d = new Trajectory3DViewer('traj-3d-canvas', 'traj-3d-info', { center: [220, 260, 0], gridW: 480, gridH: 520 });
+  const viewer3d = new Trajectory3DViewer('traj-3d-canvas', 'traj-3d-info', { center: [240, -50, 0], gridW: 540, gridH: 620 });
+  let centerInitialized = false;
   const canvas = document.getElementById('live-canvas');
   const ctx = canvas.getContext('2d');
   const fpsBadge = document.getElementById('fps-indicator');
@@ -682,6 +687,10 @@ def render_single_arm_html() -> str:
       u: Math.round((e.clientX - r.left) * (640 / r.width)),
       v: Math.round((e.clientY - r.top) * (480 / r.height))
     });
+  });
+  canvas.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    postApi('/api/clear_point');
   });
 
   function switchTab(id, btn) {
@@ -780,10 +789,22 @@ def render_single_arm_html() -> str:
         stClick.innerText = '请点击左侧桌面空白位置'; stClick.style.color = '#facc15';
       }
 
-      // 更新 3D 质点轨迹画面
+      // 更新 3D 质点轨迹画面 (确保中心点跟随一次，不破坏用户平移视角)
       if (d.traj_3d) {
-        if (d.traj_3d.center) viewer3d.center = d.traj_3d.center;
+        if (d.traj_3d.center) {
+          viewer3d.defaultCenter = d.traj_3d.center;
+          if (!centerInitialized) {
+            viewer3d.center = [...d.traj_3d.center];
+            centerInitialized = true;
+          }
+        }
         viewer3d.updateData(d.traj_3d.points, d.traj_3d.curr);
+      }
+
+      const bClr = document.getElementById('btn-clear-pt'), bClrIdle = document.getElementById('btn-clear-pt-idle');
+      if (bClr && bClrIdle) {
+        bClr.style.display = d.clicked_uv ? 'inline-block' : 'none';
+        bClrIdle.style.display = d.clicked_uv ? 'none' : 'inline-block';
       }
 
       document.getElementById('cal-arm-live').innerText =
@@ -803,7 +824,7 @@ def render_single_arm_html() -> str:
 
       const logBox = document.getElementById('log-box');
       if (d.logs && d.logs.length > 0) {
-        logBox.innerText = d.logs.join('\n');
+        logBox.innerText = d.logs.slice(-12).join('\n');
         logBox.scrollTop = logBox.scrollHeight;
       }
     }).catch(() => {});
@@ -834,11 +855,11 @@ def render_dual_arm_html() -> str:
   .pill.warn { background: #78350f; color: #fde68a; border-color: #f59e0b; }
   .pill.err { background: #450a0a; color: #fca5a5; border-color: #ef4444; }
   .top-visuals { display: grid; grid-template-columns: 1.25fr 1fr; gap: 14px; margin-bottom: 14px; }
-  .three-cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .three-cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; align-items: start; }
   @media (max-width: 1120px) { .top-visuals, .three-cols { grid-template-columns: 1fr; } }
   .card { background: #111827; border: 1px solid #334155; border-radius: 12px; overflow: hidden; box-shadow: 0 8px 20px rgba(0,0,0,0.45); display: flex; flex-direction: column; }
   .card-hdr { padding: 9px 13px; background: #1e293b; display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 700; }
-  .col-body { padding: 12px; display: flex; flex-direction: column; gap: 9px; flex: 1; }
+  .col-body { padding: 12px; display: flex; flex-direction: column; gap: 9px; }
   .canvas-wrapper { position: relative; background: #000; display: flex; justify-content: center; }
   canvas { width: 100%; height: auto; display: block; }
   #live-canvas { aspect-ratio: 4/3; cursor: crosshair; }
@@ -862,7 +883,7 @@ def render_dual_arm_html() -> str:
   .btn-red { background: #dc2626; }
   .btn-slate { background: #475569; }
   .btn-sm { padding: 4px 8px; font-size: 11px; }
-  .log-box { background: #020617; border: 1px solid #1e293b; border-radius: 8px; padding: 8px 10px; font-family: monospace; font-size: 11px; line-height: 1.45; color: #cbd5e1; height: 155px; overflow-y: auto; white-space: pre-wrap; }
+  .log-box { background: #020617; border: 1px solid #1e293b; border-radius: 8px; padding: 8px 10px; font-family: monospace; font-size: 11px; line-height: 1.45; color: #cbd5e1; height: 145px; max-height: 145px; min-height: 145px; overflow-y: auto; white-space: pre-wrap; flex: none; }
   table { width: 100%; border-collapse: collapse; font-size: 10.5px; }
   th, td { border-bottom: 1px solid #1e293b; padding: 3px; text-align: left; }
   input[type="range"] { width: 100%; }
@@ -948,8 +969,9 @@ def render_dual_arm_html() -> str:
           <div class="fps-badge" id="fps-indicator">SYNC...</div>
         </div>
         <div class="tip-banner">
-          <span id="st-click" style="color:#facc15;">💡 点击绿桌面任意空位评估双臂可达性 🎯</span>
-          <button class="btn-slate btn-sm" onclick="postApi('/api/clear_point')">清除选点</button>
+          <span id="st-click" style="color:#facc15;">💡 左键点击绿桌面选点 · 右键或按右侧按钮清除 🎯</span>
+          <button class="btn-red btn-sm" id="btn-clear-pt" onclick="postApi('/api/clear_point')" style="display:none;">❌ 消除目标点</button>
+          <button class="btn-slate btn-sm" id="btn-clear-pt-idle" onclick="postApi('/api/clear_point')">消除目标点</button>
         </div>
       </div>
 
@@ -1207,8 +1229,8 @@ def render_dual_arm_html() -> str:
         <button class="btn-purple" id="c-btn-relay" onclick="postApi('/api/pick_and_place',{arm_mode:'relay'})">🤝 双臂协同接力 (源臂→中继交接→另一臂)</button>
         <button class="btn-slate" id="c-btn-home" onclick="postApi('/api/retract_home',{arm_id:'all'})">🏠 双臂同步安全回原点</button>
 
-        <div style="font-size:11.5px; color:#94a3b8; font-weight:700; margin-top:2px;">双臂运行实时日志:</div>
-        <div class="log-box" id="log-box" style="flex:1;">等待指令...</div>
+        <div style="font-size:11.5px; color:#94a3b8; font-weight:700; margin-top:2px;">双臂运行实时日志 (最近12条):</div>
+        <div class="log-box" id="log-box">等待指令...</div>
       </div>
     </div>
   </div>
@@ -1254,6 +1276,10 @@ def render_dual_arm_html() -> str:
       u: Math.round((e.clientX - r.left) * (640 / r.width)),
       v: Math.round((e.clientY - r.top) * (480 / r.height))
     });
+  });
+  canvas.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    postApi('/api/clear_point');
   });
 
   function postApi(url, body = {}) {
@@ -1439,6 +1465,12 @@ def render_dual_arm_html() -> str:
         if (txt) txt.innerText = sw.status || '--';
       }
 
+      const bClr = document.getElementById('btn-clear-pt'), bClrIdle = document.getElementById('btn-clear-pt-idle');
+      if (bClr && bClrIdle) {
+        bClr.style.display = d.clicked_uv ? 'inline-block' : 'none';
+        bClrIdle.style.display = d.clicked_uv ? 'none' : 'inline-block';
+      }
+
       document.getElementById('c-btn-auto').disabled = d.task_busy || !d.tag_detected;
       document.getElementById('c-btn-autopl').disabled = d.task_busy || !d.tag_detected || !d.clicked_uv;
       document.getElementById('c-btn-relay').disabled = d.task_busy || !d.tag_detected || !d.clicked_uv;
@@ -1446,7 +1478,7 @@ def render_dual_arm_html() -> str:
 
       const logBox = document.getElementById('log-box');
       if (d.logs && d.logs.length > 0) {
-        logBox.innerText = d.logs.join('\n');
+        logBox.innerText = d.logs.slice(-12).join('\n');
         logBox.scrollTop = logBox.scrollHeight;
       }
     }).catch(() => {});
