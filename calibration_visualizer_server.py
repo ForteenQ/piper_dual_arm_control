@@ -538,8 +538,19 @@ class DualArmVisualWorkerNode(Node):
 
             now_t = time.time()
             if MODE == 'single':
-                # 单臂演示台：保持纯单标靶识别与追踪，绝不混入双臂标签
-                det = self.detector.detect(frame, K, D, depth)
+                # 单臂演示台：始终保持单标靶模式，若场内有多个方块则自动择优锁定距本臂最近的 1 块
+                cands = self.detector.detect_all(frame, K, D, depth)
+                det = None
+                if len(cands) == 1:
+                    det = cands[0]
+                elif len(cands) > 1:
+                    best_r = 1e9
+                    for cand in cands:
+                        ps_c, _ = state.transform_cam_to_arm(PRIMARY_ARM, cand["p_cam"])
+                        r_c = float(math.hypot(ps_c[0], ps_c[1])) if ps_c is not None else float(np.linalg.norm(cand["p_cam"]))
+                        if r_c < best_r:
+                            best_r = r_c
+                            det = cand
                 if det is not None:
                     self.last_detect_time = now_t
                     raw_corners = det["corners"].reshape((4, 2))
