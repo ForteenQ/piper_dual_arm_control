@@ -421,9 +421,9 @@ def render_single_arm_html() -> str:
   .pill.err { background: #450a0a; color: #fca5a5; border-color: #ef4444; }
   .top-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 16px; }
   @media (max-width: 1060px) { .top-grid { grid-template-columns: 1fr; } }
-  .card { background: #111827; border: 1px solid #334155; border-radius: 12px; overflow: hidden; box-shadow: 0 8px 20px rgba(0,0,0,0.45); }
+  .card { background: #111827; border: 1px solid #334155; border-radius: 12px; overflow: visible; box-shadow: 0 8px 20px rgba(0,0,0,0.45); position: relative; }
   .card-hdr { padding: 9px 14px; background: #1e293b; display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 600; }
-  .canvas-wrapper { position: relative; background: #000; display: flex; justify-content: center; }
+  .canvas-wrapper { position: relative; background: #000; display: flex; justify-content: center; overflow: hidden; border-radius: 0 0 11px 11px; }
   canvas { width: 100%; height: auto; display: block; }
   #live-canvas { max-width: 640px; aspect-ratio: 4/3; cursor: crosshair; }
   #traj-3d-canvas { aspect-ratio: 16/10; cursor: grab; background: #050b16; }
@@ -857,10 +857,10 @@ def render_dual_arm_html() -> str:
   .top-visuals { display: grid; grid-template-columns: 1.25fr 1fr; gap: 14px; margin-bottom: 14px; }
   .three-cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; align-items: start; }
   @media (max-width: 1120px) { .top-visuals, .three-cols { grid-template-columns: 1fr; } }
-  .card { background: #111827; border: 1px solid #334155; border-radius: 12px; overflow: hidden; box-shadow: 0 8px 20px rgba(0,0,0,0.45); display: flex; flex-direction: column; }
+  .card { background: #111827; border: 1px solid #334155; border-radius: 12px; overflow: visible; box-shadow: 0 8px 20px rgba(0,0,0,0.45); display: flex; flex-direction: column; position: relative; }
   .card-hdr { padding: 9px 13px; background: #1e293b; display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 700; }
   .col-body { padding: 12px; display: flex; flex-direction: column; gap: 9px; }
-  .canvas-wrapper { position: relative; background: #000; display: flex; justify-content: center; }
+  .canvas-wrapper { position: relative; background: #000; display: flex; justify-content: center; overflow: hidden; border-radius: 0 0 11px 11px; }
   canvas { width: 100%; height: auto; display: block; }
   #live-canvas { aspect-ratio: 4/3; cursor: crosshair; }
   #traj-3d-canvas { aspect-ratio: 16/10; cursor: grab; background: #050b16; }
