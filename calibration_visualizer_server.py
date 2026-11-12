@@ -1322,16 +1322,16 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
     p_lift = np.array([p_grasp[0], p_grasp[1], p_grasp[2] + 0.080])
 
     # 3. 放置点高度计算：
-    # 目标底座承载面基准高度 (普通桌面放置 vs 堆叠在方块顶面)
-    ground_z = float(p_place_base[2]) if (p_place_base is not None and len(p_place_base) > 2) else z_desk
+    # 彻底杜绝悬空与挤压：地面放置必须贴准真实桌面基准 z_desk；堆叠放置则以公共底座顶面为基准
     if is_stack_place:
-        # 堆叠模式：底座是下方方块A，其顶面高度为 ground_z + 0.025m (方块高25mm)
-        # 为防止下压挤压下方方块，额外留出 +4.5mm 柔顺轻放安全裕量，指尖在方块A上方约2-3mm处松爪自然平稳就位
-        z_pl_base = ground_z + 0.025 + tip_above_bottom + 0.0045
-        state.add_log(f"📐 [{arm_id.upper()}] 顶层堆叠放置 (防挤压柔顺轻放裕量+4.5mm -> Z={z_pl_base*1000:.1f}mm)")
+        # 堆叠模式：底座是公共交汇点处的下方方块A，其顶面高度为交汇点桌面基准 + 0.025m
+        mid_ground_z = float(p_place_base[2]) if (p_place_base is not None and len(p_place_base) > 2) else z_desk
+        z_pl_base = mid_ground_z + 0.025 + tip_above_bottom + 0.0045
+        state.add_log(f"📐 [{arm_id.upper()}] 顶层堆叠放置 (防挤压轻放裕量+4.5mm -> Z={z_pl_base*1000:.1f}mm)")
     else:
-        # 地面放置模式：贴近桌面温柔就位 (+1.5mm)
-        z_pl_base = ground_z + tip_above_bottom + 0.0015
+        # 地面放置模式：严格以真实物理桌面 z_desk 为承载面，紧贴桌面温柔就位 (+1.5mm)，绝不因顶面记忆高差悬空
+        z_pl_base = z_desk + tip_above_bottom + 0.0015
+        state.add_log(f"📐 [{arm_id.upper()}] 贴地平稳放置 (贴桌面微隙+1.5mm -> Z={z_pl_base*1000:.1f}mm, 桌面Z={z_desk*1000:.1f}mm)")
 
     p_pl_dn = np.array([p_place_base[0], p_place_base[1], z_pl_base])
     p_pl_ab = np.array([p_place_base[0], p_place_base[1], z_pl_base + 0.090])
@@ -1695,6 +1695,12 @@ def run_cube_swap_workflow(target_step="all"):
                     state.swap_workflow_step = 4
                     state.anchors_locked = False # 完整流程全部结束，允许后续重新锁定新位置
                 state.add_log("🏆 [阶段 4/4] 双方块【堆叠与空间互换】全流程圆满成功完成！")
+                # 修复核心：指挥 A 臂与 B 臂双臂全部平稳退回安全折叠原点 (Home)
+                state.add_log("🏠 全流程圆满结束，正在指挥双臂全部平稳退回安全折叠原点 (Home)...")
+                try:
+                    run_retract_home_worker(arm_id="all")
+                except Exception as _e_hm:
+                    state.add_log(f"⚠️ 双臂回原点通知: {_e_hm}")
 
         if state.swap_workflow_step == 4:
             state.swap_workflow_status = "🎉 工作流完成 (双方块空间互换已实现)"
