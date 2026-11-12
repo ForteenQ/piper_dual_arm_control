@@ -595,7 +595,7 @@ class SingleArmController:
                             desired_pos.append(pos_j)
 
                         raw_cmds = [int(v * RAD_TO_RAW) for v in desired_pos]
-                        p.MotionCtrl_2(0x01, 0x01, 50, 0x00)
+                        p.MotionCtrl_2(0x01, 0x01, 100, 0x00)
                         p.JointCtrl(*raw_cmds)
 
                         actual_pos = self._get_joints_rad(p)
@@ -614,9 +614,31 @@ class SingleArmController:
                             time.sleep(sleep_dt)
 
                 if segments:
-                    final_raw = [int(v * RAD_TO_RAW) for v in segments[-1]['p1']]
-                    p.MotionCtrl_2(0x01, 0x01, 50, 0x00)
-                    p.JointCtrl(*final_raw)
+                    final_pos = segments[-1]['p1']
+                    final_raw = [int(v * RAD_TO_RAW) for v in final_pos]
+                    # 末段闭环位置收敛等待：确保机械臂实际关节已完全下探/运动到位再返回成功，杜绝未到位即提前松爪掉落
+                    settle_deadline = time.monotonic() + 0.85
+                    prev_err = 999.0
+                    stable_cnt = 0
+                    while time.monotonic() < settle_deadline:
+                        if goal_handle.is_cancel_requested:
+                            goal_handle.canceled()
+                            result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
+                            return result
+                        p.MotionCtrl_2(0x01, 0x01, 100, 0x00)
+                        p.JointCtrl(*final_raw)
+                        actual_pos = self._get_joints_rad(p)
+                        cur_err = max(abs(final_pos[j] - actual_pos[j]) for j in range(6))
+                        if cur_err <= 0.008:
+                            break
+                        if abs(prev_err - cur_err) < 0.0008 and cur_err <= 0.025:
+                            stable_cnt += 1
+                            if stable_cnt >= 6:
+                                break
+                        else:
+                            stable_cnt = 0
+                        prev_err = cur_err
+                        time.sleep(0.01)
 
                 goal_handle.succeed()
                 result.error_code = FollowJointTrajectory.Result.SUCCESSFUL

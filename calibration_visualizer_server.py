@@ -989,7 +989,7 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
         tb_pos, _ = state.transform_cam_to_arm(arm_id, target_cam_pos)
         if tb_pos is None:
             return False
-        z_pl_down = z_desk + tip_above_bottom + 0.0015
+        z_pl_down = z_desk + tip_above_bottom + 0.0003
         z_pl_above = z_pl_down + 0.090
         p_pl_ab = np.array([tb_pos[0], tb_pos[1], z_pl_above])
         p_pl_dn = np.array([tb_pos[0], tb_pos[1], z_pl_down])
@@ -1060,8 +1060,9 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
             if not node.send_trajectory(arm_id, [q_pl_above], 3.8 / spd_f):
                 return False
             spd_f = state.get_arm_speed_factor(arm_id)
-            if not node.send_trajectory(arm_id, wp_pl_down, 2.8 / spd_f):
+            if not node.send_trajectory(arm_id, wp_pl_down, max(2.2, 3.0 / spd_f)):
                 return False
+            time.sleep(0.15)
             with state.lock:
                 state.carrying_arm = None
             node.send_gripper(arm_id, 55.0, effort)
@@ -1231,30 +1232,42 @@ def ensure_arm_yielded(arm_id: str):
     worker_node.send_trajectory(arm_id, [q_yield], 2.4 / spd_f)
 
 
+def _execute_retract_home(arm_id="all", skip_if_at_home=False):
+    """内部回安全折叠原点执行函数（不抢占 task_busy，供独立任务及工作流收尾共用）"""
+    targets = ("arm_a", "arm_b") if arm_id == "all" else (arm_id,)
+    q_home = get_home_joints_rad()
+    for aid in targets:
+        with state.lock:
+            rt = state.arm_runtime[aid]
+            alive = rt["motors_alive"]
+            q_curr = rt["joints"].copy() if rt["joints"] is not None else None
+            effort = int(state.config["arms"][aid].get("grasp_effort", 350))
+        if not alive or q_curr is None:
+            state.add_log(f"⚠️ [{aid.upper()}] 离线或未上电，跳过回原点")
+            continue
+        if skip_if_at_home and float(np.max(np.abs(q_curr - q_home))) < 0.045:
+            state.add_log(f"🏠 [{aid.upper()}] 已处于安全折叠原点，无需重复复位")
+            worker_node.send_gripper(aid, 0.0, effort)
+            continue
+        spd_f = state.get_arm_speed_factor(aid)
+        T_bc = state.get_arm_T_base_cam(aid)
+        cam_pos = T_bc[:3, 3] if T_bc is not None else None
+        state.add_log(f"🏠 [{aid.upper()}] 正在退回安全折叠原点 (速率:{int(spd_f*100)}%)...")
+        q_mid = choose_safe_ready_pose(float(q_curr[0]), q_curr, q_home, cam_pos)
+        ok_ret = worker_node.send_trajectory(aid, [q_mid, q_home], 3.8 / spd_f)
+        if not ok_ret:
+            state.add_log(f"⚠️ [{aid.upper()}] 回原点轨迹执行异常，请检查机械臂状态")
+        worker_node.send_gripper(aid, 0.0, effort)
+    state.add_log("✅ 安全折叠原点复位完成！")
+
+
 def run_retract_home_worker(arm_id="all"):
     with state.lock:
         if state.task_busy:
             return
         state.task_busy = True
     try:
-        targets = ("arm_a", "arm_b") if arm_id == "all" else (arm_id,)
-        q_home = get_home_joints_rad()
-        for aid in targets:
-            with state.lock:
-                rt = state.arm_runtime[aid]
-                alive = rt["motors_alive"]
-                q_curr = rt["joints"]
-                effort = int(state.config["arms"][aid].get("grasp_effort", 350))
-            if not alive or q_curr is None:
-                continue
-            spd_f = state.get_arm_speed_factor(aid)
-            T_bc = state.get_arm_T_base_cam(aid)
-            cam_pos = T_bc[:3, 3] if T_bc is not None else None
-            state.add_log(f"🏠 [{aid.upper()}] 正在退回安全折叠原点 (速率:{int(spd_f*100)}%)...")
-            q_mid = choose_safe_ready_pose(float(q_curr[0]), q_curr, q_home, cam_pos)
-            worker_node.send_trajectory(aid, [q_mid, q_home], 3.8 / spd_f)
-            worker_node.send_gripper(aid, 0.0, effort)
-        state.add_log("✅ 安全折叠原点复位完成！")
+        _execute_retract_home(arm_id=arm_id, skip_if_at_home=False)
     finally:
         with state.lock:
             state.task_busy = False
@@ -1267,7 +1280,7 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
                                pick_edge_dir=None, place_edge_dir=None,
                                cube_top_z_ref: float = None, cube_key: str = "A",
                                is_stack_place: bool = False, is_stack_pick: bool = False,
-                               retreat_home: bool = False) -> bool:
+                               retreat_home: bool = False, pick_top_z_obs: float = None) -> bool:
     """
     通用高精度笛卡尔搬运原子动作
     - 动作前自动校验对侧臂已停靠至外侧触碰不到的安全待命位
@@ -1314,8 +1327,13 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
     if is_stack_pick:
         state.add_log(f"📐 [{arm_id.upper()}] 顶层抓取模式 (Z高度 +25mm -> {base_pick_z*1000:.1f}mm)")
 
-    # 计算抓紧时指尖距离方块底面的真实偏移量 (>=3mm)
+    # 计算抓紧时指尖距离方块底面的真实偏移量 (>=3mm)；顶层取块时结合视觉实测底面修正
     tip_above_bottom = z_pick_floor - z_desk
+    if is_stack_pick and pick_top_z_obs is not None:
+        if (z_desk + 0.036) <= float(pick_top_z_obs) <= (z_desk + 0.062):
+            cube_bottom_obs = float(pick_top_z_obs) - 0.025
+            tip_above_bottom = max(0.001, min(0.010, base_pick_z - cube_bottom_obs))
+            state.add_log(f"📐 [{arm_id.upper()}] 结合顶层视觉实测校正抓持底高差: {tip_above_bottom*1000:.1f}mm")
 
     p_grasp = np.array([p_pick_base[0] + x_off, p_pick_base[1] + y_off, base_pick_z])
     p_pre = np.array([p_grasp[0], p_grasp[1], p_grasp[2] + 0.090])
@@ -1329,9 +1347,9 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
         z_pl_base = mid_ground_z + 0.025 + tip_above_bottom + 0.0045
         state.add_log(f"📐 [{arm_id.upper()}] 顶层堆叠放置 (防挤压轻放裕量+4.5mm -> Z={z_pl_base*1000:.1f}mm)")
     else:
-        # 地面放置模式：严格以真实物理桌面 z_desk 为承载面，紧贴桌面温柔就位 (+1.5mm)，绝不因顶面记忆高差悬空
-        z_pl_base = z_desk + tip_above_bottom + 0.0015
-        state.add_log(f"📐 [{arm_id.upper()}] 贴地平稳放置 (贴桌面微隙+1.5mm -> Z={z_pl_base*1000:.1f}mm, 桌面Z={z_desk*1000:.1f}mm)")
+        # 地面放置模式：严格以真实物理桌面 z_desk 为承载面，极微隙贴地平稳就位 (+0.3mm)，消除空中掉落感
+        z_pl_base = z_desk + tip_above_bottom + 0.0003
+        state.add_log(f"📐 [{arm_id.upper()}] 贴地平稳放置 (贴桌面微隙+0.3mm -> Z={z_pl_base*1000:.1f}mm, 桌面Z={z_desk*1000:.1f}mm)")
 
     p_pl_dn = np.array([p_place_base[0], p_place_base[1], z_pl_base])
     p_pl_ab = np.array([p_place_base[0], p_place_base[1], z_pl_base + 0.090])
@@ -1425,8 +1443,10 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
         if state.abort_workflow_flag: return False
         spd_f = state.get_arm_speed_factor(arm_id)
         state.add_log(f"⬇️ [{arm_id.upper()}] 贴近桌面垂直下探就位...")
-        if not node.send_trajectory(arm_id, wp_pl_down, 2.8 / spd_f):
+        if not node.send_trajectory(arm_id, wp_pl_down, max(2.2, 3.0 / spd_f)):
             return False
+        # 短暂稳态缓冲，确保机械臂末端完全静止贴准桌面后再松爪
+        time.sleep(0.15)
 
         with state.lock:
             state.carrying_arm = None
@@ -1624,9 +1644,10 @@ def run_cube_swap_workflow(target_step="all"):
             elif step == 3:
                 state.swap_workflow_status = "阶段 3/4: A臂取下顶层方块B送至A初始位"
                 state.add_log("🧱 [阶段 3/4] 机械臂 A 前出取下顶层方块 B (+25mm) -> 送往方块 A 初始位置 -> 避让让位...")
-                # 若视觉在公共区看到了实时方块，直接修正微偏并对齐真实角度
+                # 若视觉在公共区看到了实时方块，直接修正微偏并对齐真实角度，同时记录顶层实测高度
                 mid_pick_pt = p_mid_A.copy()
                 mid_pick_ed = np.array([1.0, 0.0, 0.0])
+                mid_pick_top_z_obs = None
                 with state.lock:
                     for ck in ("A", "B"):
                         c_cam = state.cubes[ck]["p_cam"]
@@ -1635,6 +1656,7 @@ def run_cube_swap_workflow(target_step="all"):
                             pb_chk, pe_chk = state.transform_cam_to_arm("arm_a", c_cam, c_yaw)
                             if pb_chk is not None and np.hypot(pb_chk[0] - p_mid_A[0], pb_chk[1] - p_mid_A[1]) < 0.045:
                                 mid_pick_pt[0], mid_pick_pt[1] = pb_chk[0], pb_chk[1]
+                                mid_pick_top_z_obs = float(pb_chk[2])
                                 if pe_chk is not None: mid_pick_ed = pe_chk
                                 break
 
@@ -1647,7 +1669,8 @@ def run_cube_swap_workflow(target_step="all"):
                     cube_top_z_ref=top_z_A,
                     cube_key="B",
                     is_stack_place=False,
-                    is_stack_pick=True
+                    is_stack_pick=True,
+                    pick_top_z_obs=mid_pick_top_z_obs
                 )
                 if not ok:
                     state.add_log("❌ [阶段 3/4] 执行失败，已安全中止")
@@ -1695,10 +1718,10 @@ def run_cube_swap_workflow(target_step="all"):
                     state.swap_workflow_step = 4
                     state.anchors_locked = False # 完整流程全部结束，允许后续重新锁定新位置
                 state.add_log("🏆 [阶段 4/4] 双方块【堆叠与空间互换】全流程圆满成功完成！")
-                # 修复核心：指挥 A 臂与 B 臂双臂全部平稳退回安全折叠原点 (Home)
+                # 修复核心：直接调用内部回原点函数（不受当前工作流 task_busy 锁定拦截），确保 A 臂与 B 臂双双安全退回折叠原点 (Home)
                 state.add_log("🏠 全流程圆满结束，正在指挥双臂全部平稳退回安全折叠原点 (Home)...")
                 try:
-                    run_retract_home_worker(arm_id="all")
+                    _execute_retract_home(arm_id="all", skip_if_at_home=True)
                 except Exception as _e_hm:
                     state.add_log(f"⚠️ 双臂回原点通知: {_e_hm}")
 
