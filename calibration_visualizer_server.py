@@ -1035,7 +1035,7 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
         tb_pos, _ = state.transform_cam_to_arm(arm_id, target_cam_pos)
         if tb_pos is None:
             return False
-        z_pl_down = z_desk + tip_above_bottom - 0.0015
+        z_pl_down = z_desk + tip_above_bottom + 0.0003
         z_pl_above = z_pl_down + 0.090
         p_pl_ab = np.array([tb_pos[0], tb_pos[1], z_pl_above])
         p_pl_dn = np.array([tb_pos[0], tb_pos[1], z_pl_down])
@@ -1335,7 +1335,7 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
                                retreat_home: bool = False, pick_top_z_obs: float = None,
                                async_yield_other: bool = False, allow_other_home: bool = False,
                                wait_prev_thread: dict = None, wait_phase: str = "before_move",
-                               async_retreat: dict = None) -> bool:
+                               async_retreat: dict = None, place_z_adjust_mm: float = 0.0) -> bool:
     """
     通用高精度笛卡尔搬运原子动作
     - 支持上一步退避/归位与本步准备规划并发重叠，消除步骤间无效等待
@@ -1393,13 +1393,11 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
     effort = int(arm_cfg.get("grasp_effort", 350))
     grip_w = float(arm_cfg.get("grasp_target_mm", 26.5))
 
-    # 1. 精确反推局部真实桌面基准 Z (结合标定桌面中位数做防高漂钳位，解决下放悬空问题)
-    # 已知标准方块高度为 25mm (0.025m)，标定时 table_z_base 扣除了 0.030m，故真实标定桌面为 table_z + 0.005
-    table_z_real = table_z + 0.005
-    z_desk = table_z_real
+    # 1. 精确反推局部真实桌面基准 Z (解决下放悬空问题)
+    # 已知标准方块高度为 25mm (0.025m)
+    z_desk = table_z
     if cube_top_z_ref is not None:
-        z_desk_obs = float(cube_top_z_ref) - 0.025
-        z_desk = max(table_z_real - 0.006, min(z_desk_obs, table_z_real + 0.0015))
+        z_desk = float(cube_top_z_ref) - 0.025
 
     # 2. 抓取点高度与抓持底高差计算
     z_pick_floor = max(z_desk + 0.003, (z_desk + 0.025) + z_off)
@@ -1420,16 +1418,15 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
     p_lift = np.array([p_grasp[0], p_grasp[1], p_grasp[2] + 0.080])
 
     # 3. 放置点高度计算：
-    # 彻底杜绝悬空与挤压：地面放置必须贴准真实桌面基准 z_desk；堆叠放置则以公共底座顶面为基准
+    # 彻底杜绝悬空与挤压：地面放置默认贴地微隙 +0.3mm，并支持按步骤独立微调 place_z_adjust_mm
     if is_stack_place:
         # 堆叠模式：底座是公共交汇点处的下方方块A，其顶面高度为交汇点桌面基准 + 0.025m
         mid_ground_z = float(p_place_base[2]) if (p_place_base is not None and len(p_place_base) > 2) else z_desk
         z_pl_base = mid_ground_z + 0.025 + tip_above_bottom + 0.0045
         state.add_log(f"📐 [{arm_id.upper()}] 顶层堆叠放置 (防挤压轻放裕量+4.5mm -> Z={z_pl_base*1000:.1f}mm)")
     else:
-        # 地面放置模式：以真实物理桌面 z_desk 为基准并施加 -1.5mm 轻贴补偿（指尖仍高出桌面 >=1.5mm 不撞桌），彻底消除空中掉落感
-        z_pl_base = z_desk + tip_above_bottom - 0.0015
-        state.add_log(f"📐 [{arm_id.upper()}] 贴地平稳放置 (贴桌面轻贴补偿-1.5mm -> Z={z_pl_base*1000:.1f}mm, 桌面Z={z_desk*1000:.1f}mm)")
+        z_pl_base = z_desk + tip_above_bottom + 0.0003 + (float(place_z_adjust_mm) / 1000.0)
+        state.add_log(f"📐 [{arm_id.upper()}] 贴地平稳放置 (微隙+0.3mm, 步调{place_z_adjust_mm:+.1f}mm -> Z={z_pl_base*1000:.1f}mm, 桌面Z={z_desk*1000:.1f}mm)")
 
     p_pl_dn = np.array([p_place_base[0], p_place_base[1], z_pl_base])
     p_pl_ab = np.array([p_place_base[0], p_place_base[1], z_pl_base + 0.090])
@@ -1729,7 +1726,8 @@ def run_cube_swap_workflow(target_step="all"):
                     is_stack_pick=False,
                     async_yield_other=True,
                     wait_prev_thread=active_retreat_ctx,
-                    async_retreat=next_retreat_ctx
+                    async_retreat=next_retreat_ctx,
+                    place_z_adjust_mm=-1.5
                 )
                 if not ok:
                     state.add_log("❌ [阶段 1/4] 执行失败，已安全中止")
@@ -1820,7 +1818,8 @@ def run_cube_swap_workflow(target_step="all"):
                     pick_top_z_obs=mid_pick_top_z_obs,
                     wait_prev_thread=active_retreat_ctx,
                     wait_phase="before_move",
-                    async_retreat=next_retreat_ctx
+                    async_retreat=next_retreat_ctx,
+                    place_z_adjust_mm=-5.5
                 )
                 if not ok:
                     state.add_log("❌ [阶段 3/4] 执行失败，已安全中止")
