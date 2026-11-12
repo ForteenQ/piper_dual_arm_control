@@ -849,6 +849,52 @@ class DualArmVisualWorkerNode(Node):
         msg.data = float(width_mm)
         io["gripper_pub"].publish(msg)
 
+    @staticmethod
+    def _build_ease_out_waypoints(q_curr, waypoints, total_duration: float, num_samples: int = 16):
+        """对跨度较大的少路点轨迹执行七次非对称前快后缓重采样，保持高速同时消除末段急刹抖动"""
+        pts_raw = [np.asarray(q_curr, dtype=float)]
+        for wp in waypoints:
+            w = np.asarray(wp, dtype=float)
+            if float(np.max(np.abs(w - pts_raw[-1]))) > 1e-4:
+                pts_raw.append(w)
+
+        n_orig = len(waypoints)
+        ts_orig = np.linspace(total_duration / n_orig, total_duration, n_orig).tolist()
+        if len(pts_raw) < 2:
+            return [np.asarray(w, dtype=float) for w in waypoints], ts_orig, [np.zeros(6)] * n_orig, [np.zeros(6)] * n_orig
+
+        pts_u = np.vstack(pts_raw)
+        if float(np.max(np.abs(pts_u[-1] - pts_u[0]))) < 0.03:
+            return [np.asarray(w, dtype=float) for w in waypoints], ts_orig, [np.zeros(6)] * n_orig, [np.zeros(6)] * n_orig
+
+        # 前 3 轴大臂连杆惯量较大，赋予略高弧长权重以优化空间段间时间分配
+        weights = np.array([1.2, 1.2, 1.2, 1.0, 1.0, 0.8], dtype=float)
+        taus = np.linspace(0.0, 1.0, num_samples + 1)
+        # 七次非对称缓停映射：前段快速加速巡航，后 65% 行程柔顺减速且末端 Jerk 趋零
+        psi = taus + 0.65 * taus * ((1.0 - taus) ** 2)
+        s_curve = 35.0 * (psi ** 4) - 84.0 * (psi ** 5) + 70.0 * (psi ** 6) - 20.0 * (psi ** 7)
+        s_curve[0], s_curve[-1] = 0.0, 1.0
+
+        if len(pts_u) == 2:
+            pts_full = pts_u[0] + s_curve[:, None] * (pts_u[1] - pts_u[0])
+        else:
+            seg_d = np.linalg.norm((pts_u[1:] - pts_u[:-1]) * weights, axis=1)
+            seg_d = np.maximum(seg_d, 1e-4)
+            s_knots = np.concatenate([[0.0], np.cumsum(seg_d)])
+            s_knots /= s_knots[-1]
+            pchip = PchipInterpolator(s_knots, pts_u, axis=0)
+            pts_full = pchip(s_curve)
+
+        ts_full = taus * float(total_duration)
+        cs = CubicSpline(ts_full, pts_full, bc_type='clamped', axis=0)
+        v_all, a_all = cs(ts_full, 1), cs(ts_full, 2)
+        return (
+            [pts_full[k] for k in range(1, len(pts_full))],
+            ts_full[1:].tolist(),
+            [v_all[k] for k in range(1, len(pts_full))],
+            [a_all[k] for k in range(1, len(pts_full))],
+        )
+
     def send_trajectory(self, arm_id: str, waypoints, total_duration: float):
         io = self.arm_io[arm_id]
         client = io["action_client"]
@@ -857,29 +903,29 @@ class DualArmVisualWorkerNode(Node):
 
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = ARM_JOINTS
-        dt_step = total_duration / len(waypoints)
 
         with state.lock:
             q_curr = state.arm_runtime[arm_id]["joints"]
 
-        vels = [np.zeros(6) for _ in waypoints]
-        accs = [np.zeros(6) for _ in waypoints]
-        if len(waypoints) >= 2 and q_curr is not None:
-            pts = np.vstack([q_curr, np.array(waypoints, dtype=float)])
-            ts = np.linspace(0.0, total_duration, len(pts))
-            if len(waypoints) >= 3:
+        out_wps = list(waypoints)
+        out_ts = np.linspace(total_duration / len(waypoints), total_duration, len(waypoints)).tolist()
+        vels = [np.zeros(6) for _ in out_wps]
+        accs = [np.zeros(6) for _ in out_wps]
+
+        if q_curr is not None and total_duration >= 0.4:
+            if 1 <= len(waypoints) <= 3:
+                out_wps, out_ts, vels, accs = self._build_ease_out_waypoints(q_curr, waypoints, total_duration)
+            elif len(waypoints) >= 4:
+                pts = np.vstack([q_curr, np.array(waypoints, dtype=float)])
+                ts = np.linspace(0.0, total_duration, len(pts))
                 cs = CubicSpline(ts, pts, bc_type='clamped', axis=0)
                 v_all, a_all = cs(ts, 1), cs(ts, 2)
                 vels = [v_all[k] for k in range(1, len(pts))]
                 accs = [a_all[k] for k in range(1, len(pts))]
-            else:
-                pchip = PchipInterpolator(ts, pts, axis=0)
-                v_all = pchip(ts, 1)
-                vels = [v_all[k] for k in range(1, len(pts))]
-                vels[-1] = np.zeros(6)
+                out_ts = ts[1:].tolist()
 
-        for i, q in enumerate(waypoints):
-            t = (i + 1) * dt_step
+        for i, q in enumerate(out_wps):
+            t = float(out_ts[i])
             pt = JointTrajectoryPoint()
             pt.positions = [float(x) for x in q]
             pt.velocities = [float(v) for v in vels[i]]
