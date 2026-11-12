@@ -1216,20 +1216,26 @@ def get_safe_yield_pose(arm_id: str) -> np.ndarray:
         return np.array([-0.15, 0.45, -0.75, 0.0, 0.60, 0.0], dtype=float)
 
 
-def ensure_arm_yielded(arm_id: str):
-    """确保指定机械臂已位于外侧安全避让区 (不退回 Home 原位，只需移至另一臂触及不到的外侧)"""
+def ensure_arm_yielded(arm_id: str, allow_home: bool = False) -> bool:
+    """确保指定机械臂已位于外侧安全避让区（或允许处于安全的折叠原点 Home）"""
     with state.lock:
         rt = state.arm_runtime[arm_id]
         if not rt["motors_alive"] or rt["joints"] is None:
-            return
+            return False
         q_curr = rt["joints"].copy()
     q_yield = get_safe_yield_pose(arm_id)
-    # 若已处于外侧安全位置附近则无需动作
+    # 若已处于外侧安全避让位附近则无需动作
     if float(np.max(np.abs(q_curr[:3] - q_yield[:3]))) < 0.25:
-        return
+        return True
+    # 若允许停在 Home 且当前已处于己侧安全折叠原点附近，同样无需再拉去避让位
+    if allow_home:
+        q_home = get_home_joints_rad()
+        if float(np.max(np.abs(q_curr - q_home))) < 0.08:
+            state.add_log(f"🏠 [{arm_id.upper()}] 已安全折叠于原点待命，无需移至避让区")
+            return True
     spd_f = state.get_arm_speed_factor(arm_id)
     state.add_log(f"🛡️ [{arm_id.upper()}] 让位至【夹爪朝向摄像头】待命区 (随时快速出击，距对侧>50cm)...")
-    worker_node.send_trajectory(arm_id, [q_yield], 2.4 / spd_f)
+    return bool(worker_node.send_trajectory(arm_id, [q_yield], 2.4 / spd_f))
 
 
 def _execute_retract_home(arm_id="all", skip_if_at_home=False):
@@ -1280,16 +1286,31 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
                                pick_edge_dir=None, place_edge_dir=None,
                                cube_top_z_ref: float = None, cube_key: str = "A",
                                is_stack_place: bool = False, is_stack_pick: bool = False,
-                               retreat_home: bool = False, pick_top_z_obs: float = None) -> bool:
+                               retreat_home: bool = False, pick_top_z_obs: float = None,
+                               async_yield_other: bool = False, allow_other_home: bool = False) -> bool:
     """
     通用高精度笛卡尔搬运原子动作
-    - 动作前自动校验对侧臂已停靠至外侧触碰不到的安全待命位
-    - 执行完毕后默认退回外侧安全避让位 (yield pose)，不再反复折回原点；最终步可选回 Home
+    - 动作前自动校验对侧臂已停靠至外侧触碰不到的安全待命位（支持并发启动避让）
+    - 执行完毕后默认退回外侧安全避让位 (yield pose)；若 retreat_home=True 则直接回归安全折叠原点
     - 全过程动态读取 speed_pct，实现全局通用速度控制
     """
     node = worker_node
     other_arm = "arm_b" if arm_id == "arm_a" else "arm_a"
-    ensure_arm_yielded(other_arm)
+    yield_res = {"ok": True}
+    yield_thread = None
+    if async_yield_other:
+        # 双臂同步启动：后台并发让对侧臂进入避让态，主线程立即开始当前臂的抓取动作
+        def _bg_yield():
+            try:
+                yield_res["ok"] = ensure_arm_yielded(other_arm, allow_home=allow_other_home)
+            except Exception as _ye:
+                state.add_log(f"⚠️ [{other_arm.upper()}] 并发避让异常: {_ye}")
+                yield_res["ok"] = False
+
+        yield_thread = threading.Thread(target=_bg_yield, daemon=True)
+        yield_thread.start()
+    else:
+        ensure_arm_yielded(other_arm, allow_home=allow_other_home)
 
     with state.lock:
         if state.abort_workflow_flag:
@@ -1435,6 +1456,11 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
             return False
 
         if state.abort_workflow_flag: return False
+        if yield_thread is not None:
+            yield_thread.join()
+            if not yield_res["ok"]:
+                state.add_log(f"❌ [{other_arm.upper()}] 并发避让失败，已安全中止进入公共区")
+                return False
         spd_f = state.get_arm_speed_factor(arm_id)
         state.add_log(f"✈️ [{arm_id.upper()}] 平移至目标上方并摆正...")
         if not node.send_trajectory(arm_id, [q_pl_above], 3.8 / spd_f):
@@ -1461,7 +1487,7 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
 
         spd_f = state.get_arm_speed_factor(arm_id)
         if retreat_home:
-            state.add_log(f"🏠 [{arm_id.upper()}] 全流程完成，退回安全折叠原点...")
+            state.add_log(f"🏠 [{arm_id.upper()}] 放置完成，直接退回安全折叠原点...")
             q_home = get_home_joints_rad()
             theta_exit = float(wp_pl_up[-1][0])
             q_exit = choose_safe_ready_pose(theta_exit, wp_pl_up[-1], q_home, cam_pos)
@@ -1474,6 +1500,8 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
             node.send_gripper(arm_id, 0.0, effort)
         return True
     finally:
+        if yield_thread is not None and yield_thread.is_alive():
+            yield_thread.join(timeout=3.0)
         with state.lock:
             state.carrying_arm = None
             state.carrying_cube = None
@@ -1562,8 +1590,8 @@ def run_cube_swap_workflow(target_step="all"):
             # 步骤 1: 机械臂 A 将 方块 A 运送至公共区域 (底座)，同时摆正对齐坐标轴
             # ------------------------------------------------------------------
             if step == 1:
-                state.swap_workflow_status = "阶段 1/4: A臂搬运方块A至公共底座"
-                state.add_log("🧱 [阶段 1/4] 机械臂 A 抓取方块 A -> 送往公共交汇点底座并摆正 -> 避让让位...")
+                state.swap_workflow_status = "阶段 1/4: 双臂同步启动 (A搬底座 + B进避让)"
+                state.add_log("🧱 [阶段 1/4] 双臂同步启动：机械臂 A 抓取方块 A 送往公共底座，同时机械臂 B 进入避让待命位...")
                 # 实时获取最新的方块A坐标与角度以精准夹取 (与单臂原地抓取完全一致)
                 with state.lock:
                     live_A = state.cubes["A"]["p_base"]
@@ -1588,7 +1616,8 @@ def run_cube_swap_workflow(target_step="all"):
                     cube_top_z_ref=top_z_A,
                     cube_key="A",
                     is_stack_place=False,
-                    is_stack_pick=False
+                    is_stack_pick=False,
+                    async_yield_other=True
                 )
                 if not ok:
                     state.add_log("❌ [阶段 1/4] 执行失败，已安全中止")
@@ -1642,8 +1671,8 @@ def run_cube_swap_workflow(target_step="all"):
             # 步骤 3: 机械臂 A 从公共区域取下顶层方块 B，送至方块 A 的初始位置
             # ------------------------------------------------------------------
             elif step == 3:
-                state.swap_workflow_status = "阶段 3/4: A臂取下顶层方块B送至A初始位"
-                state.add_log("🧱 [阶段 3/4] 机械臂 A 前出取下顶层方块 B (+25mm) -> 送往方块 A 初始位置 -> 避让让位...")
+                state.swap_workflow_status = "阶段 3/4: A臂取下顶层方块B送至A初始位并回归原点"
+                state.add_log("🧱 [阶段 3/4] 机械臂 A 前出取下顶层方块 B (+25mm) -> 送往方块 A 初始位置 -> 直接回归原点...")
                 # 若视觉在公共区看到了实时方块，直接修正微偏并对齐真实角度，同时记录顶层实测高度
                 mid_pick_pt = p_mid_A.copy()
                 mid_pick_ed = np.array([1.0, 0.0, 0.0])
@@ -1670,6 +1699,7 @@ def run_cube_swap_workflow(target_step="all"):
                     cube_key="B",
                     is_stack_place=False,
                     is_stack_pick=True,
+                    retreat_home=True,
                     pick_top_z_obs=mid_pick_top_z_obs
                 )
                 if not ok:
@@ -1677,7 +1707,7 @@ def run_cube_swap_workflow(target_step="all"):
                     return
                 with state.lock:
                     state.swap_workflow_step = 3
-                state.add_log("✅ [阶段 3/4] 成功完成！顶层方块 B 已安置在方块 A 初始位置，A臂已完全让开。")
+                state.add_log("✅ [阶段 3/4] 成功完成！顶层方块 B 已安置在方块 A 初始位置，A臂已直接回归原点。")
                 time.sleep(0.8)
 
             # ------------------------------------------------------------------
@@ -1709,7 +1739,8 @@ def run_cube_swap_workflow(target_step="all"):
                     cube_key="A",
                     is_stack_place=False,
                     is_stack_pick=False,
-                    retreat_home=True
+                    retreat_home=True,
+                    allow_other_home=True
                 )
                 if not ok:
                     state.add_log("❌ [阶段 4/4] 执行失败，已安全中止")
