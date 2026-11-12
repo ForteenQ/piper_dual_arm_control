@@ -1035,7 +1035,7 @@ def execute_single_arm_pick_place(arm_id: str, mode: str, target_cam_pos=None):
         tb_pos, _ = state.transform_cam_to_arm(arm_id, target_cam_pos)
         if tb_pos is None:
             return False
-        z_pl_down = z_desk + tip_above_bottom + 0.0003
+        z_pl_down = z_desk + tip_above_bottom - 0.0015
         z_pl_above = z_pl_down + 0.090
         p_pl_ab = np.array([tb_pos[0], tb_pos[1], z_pl_above])
         p_pl_dn = np.array([tb_pos[0], tb_pos[1], z_pl_down])
@@ -1393,11 +1393,13 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
     effort = int(arm_cfg.get("grasp_effort", 350))
     grip_w = float(arm_cfg.get("grasp_target_mm", 26.5))
 
-    # 1. 精确反推局部真实桌面基准 Z (解决下放悬空 1-2cm 问题)
-    # 已知标准方块高度为 25mm (0.025m)
-    z_desk = table_z
+    # 1. 精确反推局部真实桌面基准 Z (结合标定桌面中位数做防高漂钳位，解决下放悬空问题)
+    # 已知标准方块高度为 25mm (0.025m)，标定时 table_z_base 扣除了 0.030m，故真实标定桌面为 table_z + 0.005
+    table_z_real = table_z + 0.005
+    z_desk = table_z_real
     if cube_top_z_ref is not None:
-        z_desk = float(cube_top_z_ref) - 0.025
+        z_desk_obs = float(cube_top_z_ref) - 0.025
+        z_desk = max(table_z_real - 0.006, min(z_desk_obs, table_z_real + 0.0015))
 
     # 2. 抓取点高度与抓持底高差计算
     z_pick_floor = max(z_desk + 0.003, (z_desk + 0.025) + z_off)
@@ -1425,9 +1427,9 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
         z_pl_base = mid_ground_z + 0.025 + tip_above_bottom + 0.0045
         state.add_log(f"📐 [{arm_id.upper()}] 顶层堆叠放置 (防挤压轻放裕量+4.5mm -> Z={z_pl_base*1000:.1f}mm)")
     else:
-        # 地面放置模式：严格以真实物理桌面 z_desk 为承载面，极微隙贴地平稳就位 (+0.3mm)，消除空中掉落感
-        z_pl_base = z_desk + tip_above_bottom + 0.0003
-        state.add_log(f"📐 [{arm_id.upper()}] 贴地平稳放置 (贴桌面微隙+0.3mm -> Z={z_pl_base*1000:.1f}mm, 桌面Z={z_desk*1000:.1f}mm)")
+        # 地面放置模式：以真实物理桌面 z_desk 为基准并施加 -1.5mm 轻贴补偿（指尖仍高出桌面 >=1.5mm 不撞桌），彻底消除空中掉落感
+        z_pl_base = z_desk + tip_above_bottom - 0.0015
+        state.add_log(f"📐 [{arm_id.upper()}] 贴地平稳放置 (贴桌面轻贴补偿-1.5mm -> Z={z_pl_base*1000:.1f}mm, 桌面Z={z_desk*1000:.1f}mm)")
 
     p_pl_dn = np.array([p_place_base[0], p_place_base[1], z_pl_base])
     p_pl_ab = np.array([p_place_base[0], p_place_base[1], z_pl_base + 0.090])
@@ -1542,8 +1544,16 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
         state.add_log(f"⬇️ [{arm_id.upper()}] 贴近桌面垂直下探就位...")
         if not node.send_trajectory(arm_id, wp_pl_down, max(2.2, 3.0 / spd_f)):
             return False
-        # 短暂稳态缓冲，确保机械臂末端完全静止贴准桌面后再松爪
-        time.sleep(0.15)
+        # 短暂稳态缓冲，确保机械臂末端完全静止贴准桌面后再松爪，并记录实测 FK 指尖高度
+        time.sleep(0.18)
+        with state.lock:
+            q_rel = state.arm_runtime[arm_id]["joints"]
+            q_rel = q_rel.copy() if q_rel is not None else None
+        if q_rel is not None:
+            _, _, T_rel = piper_all_links_fk(q_rel)
+            state.add_log(
+                f"📍 [{arm_id.upper()}] 释放瞬间实测指尖 Z={T_rel[2,3]*1000:.1f}mm (目标={z_pl_base*1000:.1f}mm)"
+            )
 
         with state.lock:
             state.carrying_arm = None
