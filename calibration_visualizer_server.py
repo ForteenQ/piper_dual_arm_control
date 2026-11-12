@@ -1206,13 +1206,13 @@ def run_task_worker(mode='return', target_cam_pos=None, arm_mode_override=None):
 
 
 def get_safe_yield_pose(arm_id: str) -> np.ndarray:
-    """获取各机械臂向外侧偏转的安全避让待命姿态 (远离中间公共区 > 815mm，对侧臂绝对触及不到)"""
+    """获取各机械臂【夹爪朝着摄像头】的高位安全避让待命姿态 (各在己侧收起，无干涉且下次动作极快响应)"""
     if arm_id == "arm_a":
-        # A 臂在左侧，向自身 +Y (左外侧 +54°) 安全悬停避让
-        return np.array([0.95, 0.45, -0.75, 0.0, 0.50, 0.0], dtype=float)
+        # A 臂在左侧，高位耸立，夹爪略微下倾正对前方摄像头视野
+        return np.array([0.15, 0.45, -0.75, 0.0, 0.60, 0.0], dtype=float)
     else:
-        # B 臂在右侧，向自身 -Y (右外侧 -54°) 安全悬停避让
-        return np.array([-0.95, 0.45, -0.75, 0.0, 0.50, 0.0], dtype=float)
+        # B 臂在右侧，高位耸立，夹爪略微下倾正对前方摄像头视野
+        return np.array([-0.15, 0.45, -0.75, 0.0, 0.60, 0.0], dtype=float)
 
 
 def ensure_arm_yielded(arm_id: str):
@@ -1227,8 +1227,8 @@ def ensure_arm_yielded(arm_id: str):
     if float(np.max(np.abs(q_curr[:3] - q_yield[:3]))) < 0.25:
         return
     spd_f = state.get_arm_speed_factor(arm_id)
-    state.add_log(f"🛡️ [{arm_id.upper()}] 正在让位至外侧安全待命区 (距对侧>81cm，无需回原位)...")
-    worker_node.send_trajectory(arm_id, [q_yield], 2.6 / spd_f)
+    state.add_log(f"🛡️ [{arm_id.upper()}] 让位至【夹爪朝向摄像头】待命区 (随时快速出击，距对侧>50cm)...")
+    worker_node.send_trajectory(arm_id, [q_yield], 2.4 / spd_f)
 
 
 def run_retract_home_worker(arm_id="all"):
@@ -1321,11 +1321,17 @@ def execute_subtask_pick_place(arm_id: str, p_pick_base: np.ndarray, p_place_bas
     p_pre = np.array([p_grasp[0], p_grasp[1], p_grasp[2] + 0.090])
     p_lift = np.array([p_grasp[0], p_grasp[1], p_grasp[2] + 0.080])
 
-    # 3. 放置点高度计算：指尖下降至方块底面距离目标表面仅 +1.5mm 时温柔松爪
-    z_pl_floor = z_desk + tip_above_bottom + 0.0015
-    z_pl_base = z_pl_floor + (0.025 if is_stack_place else 0.0)
+    # 3. 放置点高度计算：
+    # 目标底座承载面基准高度 (普通桌面放置 vs 堆叠在方块顶面)
+    ground_z = float(p_place_base[2]) if (p_place_base is not None and len(p_place_base) > 2) else z_desk
     if is_stack_place:
-        state.add_log(f"📐 [{arm_id.upper()}] 顶层堆叠放置 (Z高度 +25mm -> {z_pl_base*1000:.1f}mm)")
+        # 堆叠模式：底座是下方方块A，其顶面高度为 ground_z + 0.025m (方块高25mm)
+        # 为防止下压挤压下方方块，额外留出 +4.5mm 柔顺轻放安全裕量，指尖在方块A上方约2-3mm处松爪自然平稳就位
+        z_pl_base = ground_z + 0.025 + tip_above_bottom + 0.0045
+        state.add_log(f"📐 [{arm_id.upper()}] 顶层堆叠放置 (防挤压柔顺轻放裕量+4.5mm -> Z={z_pl_base*1000:.1f}mm)")
+    else:
+        # 地面放置模式：贴近桌面温柔就位 (+1.5mm)
+        z_pl_base = ground_z + tip_above_bottom + 0.0015
 
     p_pl_dn = np.array([p_place_base[0], p_place_base[1], z_pl_base])
     p_pl_ab = np.array([p_place_base[0], p_place_base[1], z_pl_base + 0.090])
@@ -1538,12 +1544,20 @@ def run_cube_swap_workflow(target_step="all"):
             if step == 1:
                 state.swap_workflow_status = "阶段 1/4: A臂搬运方块A至公共底座"
                 state.add_log("🧱 [阶段 1/4] 机械臂 A 抓取方块 A -> 送往公共交汇点底座并摆正 -> 避让让位...")
-                # 实时获取最新的方块A坐标与角度以精准夹取
+                # 实时获取最新的方块A坐标与角度以精准夹取 (与单臂原地抓取完全一致)
                 with state.lock:
                     live_A = state.cubes["A"]["p_base"]
                     live_eA = state.cubes["A"]["edge_dir"]
-                pick_pt = live_A if (live_A is not None and np.hypot(live_A[0]-p_init_A[0], live_A[1]-p_init_A[1]) < 0.04) else p_init_A
-                pick_ed = live_eA if live_eA is not None else edge_init_A
+                    det_A = state.cubes["A"]["detected"]
+                if det_A and live_A is not None:
+                    pick_pt = live_A.copy()
+                    pick_ed = live_eA.copy() if live_eA is not None else edge_init_A
+                    top_z_A = float(pick_pt[2])
+                    state.add_log(f"🎯 [ARM_A] 实时锁定方块 A: ({pick_pt[0]*1000:.1f}, {pick_pt[1]*1000:.1f}, {pick_pt[2]*1000:.1f})mm")
+                else:
+                    pick_pt = p_init_A
+                    pick_ed = edge_init_A
+                    state.add_log(f"⚠️ [ARM_A] 采用记忆方块 A 位姿: ({pick_pt[0]*1000:.1f}, {pick_pt[1]*1000:.1f})mm")
 
                 ok = execute_subtask_pick_place(
                     arm_id="arm_a",
@@ -1561,7 +1575,7 @@ def run_cube_swap_workflow(target_step="all"):
                     return
                 with state.lock:
                     state.swap_workflow_step = 1
-                state.add_log("✅ [阶段 1/4] 成功完成！方块 A 已稳置底座，A臂已完全让开。")
+                state.add_log("✅ [阶段 1/4] 成功完成！方块 A 已稳置底座，A臂已退至前向避让位。")
                 time.sleep(0.8)
 
             # ------------------------------------------------------------------
@@ -1570,11 +1584,20 @@ def run_cube_swap_workflow(target_step="all"):
             elif step == 2:
                 state.swap_workflow_status = "阶段 2/4: B臂搬运方块B堆叠在方块A上方"
                 state.add_log("🧱 [阶段 2/4] 机械臂 B 抓取方块 B -> 堆叠在方块 A 顶面 (+25mm) 并摆正 -> 避让让位...")
+                # 核心修复：直接读取视觉最新的方块 B 实时基座位姿 (与B臂原地抓取保持完全同等的高精度逻辑)
                 with state.lock:
                     live_B = state.cubes["B"]["p_base"]
                     live_eB = state.cubes["B"]["edge_dir"]
-                pick_pt = live_B if (live_B is not None and np.hypot(live_B[0]-p_init_B[0], live_B[1]-p_init_B[1]) < 0.04) else p_init_B
-                pick_ed = live_eB if live_eB is not None else edge_init_B
+                    det_B = state.cubes["B"]["detected"]
+                if det_B and live_B is not None:
+                    pick_pt = live_B.copy()
+                    pick_ed = live_eB.copy() if live_eB is not None else edge_init_B
+                    top_z_B = float(pick_pt[2])
+                    state.add_log(f"🎯 [ARM_B] 实时锁定方块 B: ({pick_pt[0]*1000:.1f}, {pick_pt[1]*1000:.1f}, {pick_pt[2]*1000:.1f})mm")
+                else:
+                    pick_pt = p_init_B
+                    pick_ed = edge_init_B
+                    state.add_log(f"⚠️ [ARM_B] 采用记忆方块 B 位姿: ({pick_pt[0]*1000:.1f}, {pick_pt[1]*1000:.1f})mm")
 
                 ok = execute_subtask_pick_place(
                     arm_id="arm_b",
@@ -1592,7 +1615,7 @@ def run_cube_swap_workflow(target_step="all"):
                     return
                 with state.lock:
                     state.swap_workflow_step = 2
-                state.add_log("🎉 [阶段 2/4] 成功完成！方块 B 已成功叠在方块 A 上方！B臂已完全让开。")
+                state.add_log("🎉 [阶段 2/4] 成功完成！方块 B 已成功叠在方块 A 上方！B臂已退至前向避让位。")
                 time.sleep(0.8)
 
             # ------------------------------------------------------------------
