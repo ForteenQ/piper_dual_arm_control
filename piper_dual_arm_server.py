@@ -617,7 +617,7 @@ class SingleArmController:
                     final_pos = segments[-1]['p1']
                     final_raw = [int(v * RAD_TO_RAW) for v in final_pos]
                     # 末段闭环位置收敛等待：确保机械臂实际关节已完全下探/运动到位再返回成功，杜绝未到位即提前松爪掉落
-                    settle_deadline = time.monotonic() + 0.85
+                    settle_deadline = time.monotonic() + 0.55
                     prev_err = 999.0
                     stable_cnt = 0
                     while time.monotonic() < settle_deadline:
@@ -629,11 +629,11 @@ class SingleArmController:
                         p.JointCtrl(*final_raw)
                         actual_pos = self._get_joints_rad(p)
                         cur_err = max(abs(final_pos[j] - actual_pos[j]) for j in range(6))
-                        if cur_err <= 0.008:
+                        if cur_err <= 0.010:
                             break
                         if abs(prev_err - cur_err) < 0.0008 and cur_err <= 0.025:
                             stable_cnt += 1
-                            if stable_cnt >= 6:
+                            if stable_cnt >= 4:
                                 break
                         else:
                             stable_cnt = 0
